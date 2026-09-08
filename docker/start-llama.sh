@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# start-cluster.sh と同じ形式で、1行1モデルを指定する。
-# 形式: Hugging Face のリポジトリ名/ファイル名.gguf
-MODEL_NAMES=(
-  "bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-  "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf"
-)
+# モデルリストは run-llama.sh 経由で MODEL_NAMES_CSV 環境変数として渡される。
+# 形式: Hugging Face のリポジトリ名/ファイル名.gguf をカンマ区切りで指定。
+MODEL_NAMES=()
 
 MODEL_DIR="${MODEL_DIR:-/models}"
 MODEL_NAMES_CSV="${MODEL_NAMES_CSV:-}"

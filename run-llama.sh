@@ -5,11 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${IMAGE_NAME:-my-llama-server:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-my-llama-server}"
 MODEL_DIR="${MODEL_DIR:-$SCRIPT_DIR/models}"
+MODEL_LIST_FILE="${MODEL_LIST_FILE:-$SCRIPT_DIR/model_list.txt}"
 PUID="${PUID:-$(id -u)}"
 PGID="${PGID:-$(id -g)}"
 
 mkdir -p "$MODEL_DIR"
 chmod 0755 "$MODEL_DIR"
+
+# model_list.txt からモデルリストを読み込む (コメント行・空行は無視、カンマ区切りで結合)
+[[ -f "$MODEL_LIST_FILE" ]] || { echo "model list file not found: $MODEL_LIST_FILE" >&2; exit 1; }
+MODEL_NAMES_CSV="$(awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/' "$MODEL_LIST_FILE" | tr '\n' ',' | sed 's/,$//')"
+[[ -n "$MODEL_NAMES_CSV" ]] || { echo "no valid model entries in $MODEL_LIST_FILE" >&2; exit 1; }
+echo "Using models from $MODEL_LIST_FILE:"
+printf '  %s\n' "${MODEL_NAMES_CSV//,/$'\n  '}"
 
 docker build --tag "$IMAGE_NAME" "$SCRIPT_DIR/docker"
 
@@ -19,12 +27,12 @@ if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
 fi
 
 gpu_args=(--gpus all)
-env_args=(-e "PUID=$PUID" -e "PGID=$PGID")
+env_args=(-e "PUID=$PUID" -e "PGID=$PGID" -e "MODEL_NAMES_CSV=$MODEL_NAMES_CSV")
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   env_args+=(-e "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 fi
-# 以下の環境変数が設定されていればコンテナに引き継ぐ (start-llama.sh 参照)
-for var in MODEL_NAMES_CSV HF_ENDPOINT MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE; do
+# 以下の環境変数が設定されていればコンテナに引き継ぐ (docker/start-llama.sh 参照)
+for var in HF_ENDPOINT MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE; do
   if [[ -n "${!var:-}" ]]; then
     env_args+=(-e "$var=${!var}")
   fi
@@ -38,4 +46,3 @@ docker run --detach --name "$CONTAINER_NAME" \
   --publish "${PORT:-8080}:${PORT:-8080}" \
   --volume "$MODEL_DIR:/models" \
   "$IMAGE_NAME"
-
