@@ -99,7 +99,7 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
 | `MAX_CONTEXT_SIZE` | (未設定=上限なし) | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用) |
 | `N_GPU_LAYERS` | `auto` | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる |
 | `MODELS_MAX` | `1` | 同時にロードしておくモデル数の上限(router mode) |
-| `KV_CACHE_TYPE` | (未設定=f16相当) | KVキャッシュの量子化タイプ。`q8_0`(約1/2)や`q4_0`(約1/4)を指定すると大きなコンテキスト長でも VRAM 使用量を大幅に削減できる。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
+| `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時は空き VRAM とモデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
 
 ## VRAM 管理の仕組み
 
@@ -111,7 +111,12 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
   GPU 間のレイヤー配置やコンテキストサイズを実行時の空き VRAM に応じて自動調整させています。
 - **コンテキスト長の自動検出**: `CONTEXT_SIZE` を指定しない場合、`gguf-dump` を使って各モデルの GGUF メタデータから
   `<arch>.context_length`(モデルが学習時にサポートする最大コンテキスト長)を読み取り、`ctx-size` に設定します。
-  VRAM が少ない環境では `MAX_CONTEXT_SIZE` や `KV_CACHE_TYPE=q4_0` などと組み合わせて調整してください。
+- **KV キャッシュ量子化の自動選択**: `KV_CACHE_TYPE` を指定しない場合、`nvidia-smi` で取得した空き VRAM 合計から
+  モデルファイルサイズを差し引いた「予算」を計算し、モデルの GGUF メタデータ(`block_count` /
+  `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から算出した必要 KV キャッシュ量と
+  比較して、予算に収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択します。
+  それでも収まらない場合は `q4_0` にフォールバックします。VRAM が非常に少ない環境では `MAX_CONTEXT_SIZE` も
+  併用してコンテキスト長自体を制限してください。
 
 ## Continue (VS Code拡張) との連携
 
@@ -136,8 +141,9 @@ models:
 ### `500 model name=... failed to load` (OOM)
 
 - `docker logs my-llama-server` で `cudaMalloc failed: out of memory` が出ていないか確認してください。
-- `KV_CACHE_TYPE=q4_0` を設定するとコンテキスト長あたりの VRAM 使用量を約1/4に抑えられます。
-- それでも収まらない場合は `MAX_CONTEXT_SIZE` でコンテキスト長自体を制限してください。
+- 通常は KV キャッシュ量子化が空き VRAM から自動選択されるため発生しにくいですが、他プロセスが GPU を
+  使用中で空き VRAM が少ない場合などはそれでも収まらないことがあります。その場合は `KV_CACHE_TYPE=q4_0`
+  を明示指定するか、`MAX_CONTEXT_SIZE` でコンテキスト長自体を制限してください。
 
 ### リクエストが `context size exceeded` 的なエラーになる
 

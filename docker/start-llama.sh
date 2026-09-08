@@ -23,9 +23,11 @@ N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
 # KV キャッシュの量子化タイプ (f16 既定より VRAM を大幅削減できる: q8_0 で約1/2, q4_0 で約1/4)
 # allowed: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+# 未指定の場合は、空き VRAM とモデルサイズ・コンテキスト長から必要な KV キャッシュ量を見積もり、
+# 収まる範囲でなるべく精度の高い(f16に近い)タイプを自動選択する。
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
 
-log() { printf '[llama-wrapper] %s\n' "$*"; }
+log() { printf '[llama-wrapper] %s\n' "$*" >&2; }
 die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
 
 [[ "$MODEL_IDLE_SECONDS" =~ ^[0-9]+$ ]] || die "MODEL_IDLE_SECONDS must be an integer"
@@ -46,6 +48,89 @@ detect_context_length() {
   gguf-dump --no-tensors "$model_file" 2>/dev/null \
     | awk -F'= *' '/\.context_length[[:space:]]*=/ { print $2; exit }' \
     | tr -d '[:space:]'
+}
+
+# GGUF ファイルのメタデータから KV キャッシュサイズ計算に必要な値を読み取る。
+# 見つかった場合 "block_count head_count_kv key_length value_length" を空白区切りで返す。
+detect_kv_cache_params() {
+  local model_file="$1"
+  gguf-dump --no-tensors "$model_file" 2>/dev/null | awk -F'= *' '
+    /\.block_count[[:space:]]*=/               { gsub(/[[:space:]]/, "", $2); block_count=$2 }
+    /\.attention\.head_count_kv[[:space:]]*=/   { gsub(/[[:space:]]/, "", $2); head_count_kv=$2 }
+    /\.attention\.key_length[[:space:]]*=/      { gsub(/[[:space:]]/, "", $2); key_length=$2 }
+    /\.attention\.value_length[[:space:]]*=/    { gsub(/[[:space:]]/, "", $2); value_length=$2 }
+    END {
+      if (block_count != "" && head_count_kv != "" && key_length != "" && value_length != "") {
+        print block_count, head_count_kv, key_length, value_length
+      }
+    }'
+}
+
+# 指定したキャッシュタイプ 1要素あたりのバイト数(概算)を返す。
+kv_cache_type_bytes_per_element() {
+  case "$1" in
+    f32) echo 4 ;;
+    f16|bf16) echo 2 ;;
+    q8_0) echo 1.0625 ;;
+    q5_0|q5_1) echo 0.6875 ;;
+    q4_0|q4_1|iq4_nl) echo 0.5625 ;;
+    *) echo 2 ;;
+  esac
+}
+
+# 空き VRAM 合計・モデルファイルサイズ・コンテキスト長から、収まる範囲でなるべく精度の高い
+# KV キャッシュタイプを選ぶ。精度が高い順に f16 -> q8_0 -> q4_0 を試す。
+# 引数: model_file ctx_size free_vram_bytes_total
+select_kv_cache_type() {
+  local model_file="$1" ctx_size="$2" free_bytes="$3"
+  local params block_count head_count_kv key_length value_length
+  params="$(detect_kv_cache_params "$model_file")"
+  if [[ -z "$params" ]]; then
+    log "Could not detect attention params for $(basename "$model_file"); skipping KV cache type auto-selection"
+    echo ""
+    return
+  fi
+  read -r block_count head_count_kv key_length value_length <<< "$params"
+
+  local model_bytes
+  model_bytes="$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)"
+  # モデル重みロード後に KV キャッシュ用として残る VRAM (安全マージンとして 90% だけ使う想定)
+  local budget_bytes
+  budget_bytes="$(awk -v f="$free_bytes" -v m="$model_bytes" 'BEGIN { b = (f - m) * 0.9; if (b < 0) b = 0; printf "%.0f", b }')"
+
+  local candidate bytes_per_elem needed_bytes
+  for candidate in f16 q8_0 q4_0; do
+    bytes_per_elem="$(kv_cache_type_bytes_per_element "$candidate")"
+    # 必要バイト数 = 2(K+V) * block_count * head_count_kv * (key_length+value_length) * ctx_size * bytes_per_elem / 2
+    needed_bytes="$(awk -v bc="$block_count" -v hkv="$head_count_kv" -v kl="$key_length" -v vl="$value_length" \
+      -v ctx="$ctx_size" -v bpe="$bytes_per_elem" \
+      'BEGIN { printf "%.0f", bc * hkv * (kl + vl) * ctx * bpe }')"
+    if (( $(awk -v n="$needed_bytes" -v b="$budget_bytes" 'BEGIN { print (n <= b) ? 1 : 0 }') )); then
+      log "$(basename "$model_file"): estimated KV cache for $candidate = $((needed_bytes / 1024 / 1024)) MiB (budget $((budget_bytes / 1024 / 1024)) MiB) -> selected"
+      echo "$candidate"
+      return
+    else
+      log "$(basename "$model_file"): estimated KV cache for $candidate = $((needed_bytes / 1024 / 1024)) MiB exceeds budget $((budget_bytes / 1024 / 1024)) MiB"
+    fi
+  done
+  # どれも収まらない場合は最も VRAM を節約できる q4_0 にフォールバックする
+  # (それでも収まらない場合は --fit による CPU オフロードに期待する)
+  echo "q4_0"
+}
+
+# 全 GPU の空き VRAM 合計(バイト)を返す。取得できなければ 0 を返す。
+detect_total_free_vram_bytes() {
+  local free_mib_list total_mib=0
+  free_mib_list="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)"
+  if [[ -z "$free_mib_list" ]]; then
+    echo 0
+    return
+  fi
+  while read -r mib; do
+    [[ "$mib" =~ ^[0-9]+$ ]] || continue
+    total_mib=$((total_mib + mib))
+  done <<< "$free_mib_list"
+  echo $((total_mib * 1024 * 1024))
 }
 
 if [[ -n "$MODEL_NAMES_CSV" ]]; then
@@ -140,15 +225,29 @@ for filename in "${!allowed_files[@]}"; do
     model_ctx_size="$MAX_CONTEXT_SIZE"
   fi
 
+  # KV_CACHE_TYPE が明示指定されていればそれを使う。未指定なら空き VRAM から自動選択する。
+  model_kv_cache_type="$KV_CACHE_TYPE"
+  if [[ -z "$model_kv_cache_type" ]]; then
+    total_free_vram_bytes="$(detect_total_free_vram_bytes)"
+    if ((total_free_vram_bytes > 0)); then
+      model_kv_cache_type="$(select_kv_cache_type "$model_file" "$model_ctx_size" "$total_free_vram_bytes")"
+      if [[ -n "$model_kv_cache_type" ]]; then
+        log "Auto-selected KV cache type for $filename: $model_kv_cache_type"
+      fi
+    else
+      log "Could not detect free VRAM; leaving KV cache type at llama-server default (f16) for $filename"
+    fi
+  fi
+
   {
     printf '[%s]\n' "$alias_name"
     printf 'model = %s\n' "$model_file"
     printf 'ctx-size = %s\n' "$model_ctx_size"
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
     printf 'sleep-idle-seconds = %s\n' "$MODEL_IDLE_SECONDS"
-    if [[ -n "$KV_CACHE_TYPE" ]]; then
-      printf 'cache-type-k = %s\n' "$KV_CACHE_TYPE"
-      printf 'cache-type-v = %s\n' "$KV_CACHE_TYPE"
+    if [[ -n "$model_kv_cache_type" ]]; then
+      printf 'cache-type-k = %s\n' "$model_kv_cache_type"
+      printf 'cache-type-v = %s\n' "$model_kv_cache_type"
     fi
     printf '\n'
   } >> "$PRESET_FILE"
