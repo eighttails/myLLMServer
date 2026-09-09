@@ -56,18 +56,22 @@ detect_context_length() {
 
 # GGUF ファイルのメタデータから KV キャッシュサイズ計算に必要な値を読み取る。
 # 見つかった場合 "block_count head_count_kv key_length value_length" を空白区切りで返す。
+# head_count_kv は Nemotron-H のようなハイブリッド(Mamba/Transformer混在)アーキテクチャでは
+# レイヤーごとの配列(Mambaレイヤーは0、Attentionレイヤーのみ実値)として保存されている場合があるため、
+# --json --json-array で全要素を取得し、実際にアテンションで使われる最大値を採用する
+# (0 のままだと必要 KV キャッシュ量を過小評価し、VRAM 予算チェックが素通りして OOM の原因になる)。
 detect_kv_cache_params() {
   local model_file="$1"
-  gguf-dump --no-tensors "$model_file" 2>/dev/null | awk -F'= *' '
-    /\.block_count[[:space:]]*=/               { gsub(/[[:space:]]/, "", $2); block_count=$2 }
-    /\.attention\.head_count_kv[[:space:]]*=/   { gsub(/[[:space:]]/, "", $2); head_count_kv=$2 }
-    /\.attention\.key_length[[:space:]]*=/      { gsub(/[[:space:]]/, "", $2); key_length=$2 }
-    /\.attention\.value_length[[:space:]]*=/    { gsub(/[[:space:]]/, "", $2); value_length=$2 }
-    END {
-      if (block_count != "" && head_count_kv != "" && key_length != "" && value_length != "") {
-        print block_count, head_count_kv, key_length, value_length
-      }
-    }'
+  gguf-dump --no-tensors --json --json-array "$model_file" 2>/dev/null | jq -r '
+    def scalar_or_max:
+      if type == "array" then (map(select(type == "number")) | max) else . end;
+    (.metadata | to_entries) as $entries
+    | ($entries[] | select(.key | endswith(".block_count")) | .value.value | scalar_or_max) as $block_count
+    | ($entries[] | select(.key | endswith(".attention.head_count_kv")) | .value.value | scalar_or_max) as $head_count_kv
+    | ($entries[] | select(.key | endswith(".attention.key_length")) | .value.value | scalar_or_max) as $key_length
+    | ($entries[] | select(.key | endswith(".attention.value_length")) | .value.value | scalar_or_max) as $value_length
+    | "\($block_count) \($head_count_kv) \($key_length) \($value_length)"
+  ' 2>/dev/null | head -n1
 }
 
 # 指定したキャッシュタイプ 1要素あたりのバイト数(概算)を返す。

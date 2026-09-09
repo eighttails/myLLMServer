@@ -6,14 +6,17 @@ IMAGE_NAME="${IMAGE_NAME:-my-llama-server:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-my-llama-server}"
 MODEL_DIR="${MODEL_DIR:-$SCRIPT_DIR/models}"
 MODEL_LIST_FILE="${MODEL_LIST_FILE:-$SCRIPT_DIR/model_list.txt}"
+MODEL_LIST_EXAMPLE="${MODEL_LIST_EXAMPLE:-$SCRIPT_DIR/model_list.example}"
 PUID="${PUID:-$(id -u)}"
 PGID="${PGID:-$(id -g)}"
+
+# model_list.txt がなければ model_list.example をコピーする
+[[ -f "$MODEL_LIST_FILE" ]] || { echo "model list file not found: $MODEL_LIST_FILE" >&2; echo "copying from example: $MODEL_LIST_EXAMPLE" >&2; [[ -f "$MODEL_LIST_EXAMPLE" ]] && cp "$MODEL_LIST_EXAMPLE" "$MODEL_LIST_FILE"; exit 1; }
 
 mkdir -p "$MODEL_DIR"
 chmod 0755 "$MODEL_DIR"
 
 # model_list.txt からモデルリストを読み込む (コメント行・空行は無視、カンマ区切りで結合)
-[[ -f "$MODEL_LIST_FILE" ]] || { echo "model list file not found: $MODEL_LIST_FILE" >&2; exit 1; }
 MODEL_NAMES_CSV="$(awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/' "$MODEL_LIST_FILE" | tr '\n' ',' | sed 's/,$//')"
 [[ -n "$MODEL_NAMES_CSV" ]] || { echo "no valid model entries in $MODEL_LIST_FILE" >&2; exit 1; }
 echo "Using models from $MODEL_LIST_FILE:"

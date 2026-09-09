@@ -6,7 +6,7 @@ USER root
 ENV PATH="/app:${PATH}"
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && apt-get install --no-install-recommends -y ca-certificates curl jq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY start-llama.sh /usr/local/bin/start-llama.sh
