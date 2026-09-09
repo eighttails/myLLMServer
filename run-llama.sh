@@ -32,7 +32,7 @@ if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   env_args+=(-e "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 fi
 # 以下の環境変数が設定されていればコンテナに引き継ぐ (docker/start-llama.sh 参照)
-for var in HF_ENDPOINT MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE; do
+for var in HF_ENDPOINT MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE TENSOR_SPLIT_MODE; do
   if [[ -n "${!var:-}" ]]; then
     env_args+=(-e "$var=${!var}")
   fi
