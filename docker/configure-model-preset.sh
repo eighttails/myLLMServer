@@ -173,20 +173,7 @@ detect_per_gpu_tg_speed() {
     local i speed
     for ((i = 0; i < gpu_count; i++)); do
       speed="$(CUDA_VISIBLE_DEVICES="$i" llama-bench -m "$benchmark_model" -ngl 99 -p 0 -n 32 \
-        --output json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    print(0)
-    sys.exit(0)
-for row in data:
-    if row.get("n_gen", 0) > 0:
-        print(row.get("avg_ts", 0))
-        break
-else:
-    print(0)
-' 2>/dev/null)"
+        --output json 2>/dev/null | /usr/local/bin/model-preset-utils.py benchmark-speed 2>/dev/null)"
       [[ "$speed" =~ ^[0-9.]+$ ]] || speed=0
       printf '%s\n' "$speed" >> "$BENCH_TG_CACHE"
     done
@@ -196,122 +183,13 @@ else:
 
 detect_layer_bytes() {
   local model_file="$1"
-  gguf-dump --json "$model_file" 2>/dev/null | python3 -c '
-import json, sys, re
-
-QK = {
-    "F32": (1, 4), "F16": (1, 2), "BF16": (1, 2),
-    "Q4_0": (32, 18), "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24), "Q8_0": (32, 34),
-    "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210), "Q8_K": (256, 292),
-    "Q2_K": (256, 84), "Q3_K": (256, 110),
-    "IQ4_NL": (32, 18), "IQ4_XS": (256, 136),
-}
-
-def tensor_bytes(shape, typ):
-    n = 1
-    for s in shape:
-        n *= s
-    block_size, type_bytes = QK.get(typ, (1, 4))
-    return (n // block_size) * type_bytes
-
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-
-tensors = data.get("tensors", {})
-layer_bytes = {}
-other_bytes = 0
-for name, info in tensors.items():
-    b = tensor_bytes(info["shape"], info["type"])
-    m = re.match(r"^blk\.(\d+)\.", name)
-    if m:
-        idx = int(m.group(1))
-        layer_bytes[idx] = layer_bytes.get(idx, 0) + b
-    else:
-        other_bytes += b
-
-if not layer_bytes:
-    sys.exit(1)
-
-print(other_bytes)
-for idx in sorted(layer_bytes.keys()):
-    print(layer_bytes[idx])
-'
+  gguf-dump --json "$model_file" 2>/dev/null | /usr/local/bin/model-preset-utils.py layer-bytes
 }
 
 calculate_tensor_split() {
   local layer_bytes_file="$1" free_mib_list="$2" speed_list="$3" reserve_mib="$4"
-  python3 -c '
-import sys
-
-layer_bytes_file, free_mib_str, speed_str, reserve_mib = sys.argv[1:5]
-
-with open(layer_bytes_file) as f:
-    lines = [l.strip() for l in f if l.strip() != ""]
-if not lines:
-    sys.exit(1)
-other_bytes = int(lines[0])
-layer_bytes = [int(x) for x in lines[1:]]
-n_layers = len(layer_bytes)
-if n_layers == 0:
-    sys.exit(1)
-
-free_mib = [int(x) for x in free_mib_str.split() if x.strip() != ""]
-speeds = [float(x) for x in speed_str.split() if x.strip() != ""]
-n_gpu = len(free_mib)
-if n_gpu < 2 or len(speeds) != n_gpu:
-    sys.exit(1)
-if any(s <= 0 for s in speeds):
-    sys.exit(1)
-
-reserve_bytes = int(reserve_mib) * 1024 * 1024
-budget = [max(0, m * 1024 * 1024 - reserve_bytes) for m in free_mib]
-
-fastest = max(range(n_gpu), key=lambda i: speeds[i])
-budget[fastest] -= other_bytes
-if budget[fastest] < 0:
-    sys.exit(1)
-
-total_speed = sum(speeds)
-ideal = [n_layers * s / total_speed for s in speeds]
-avg_layer_bytes = sum(layer_bytes) / n_layers
-max_layers_by_budget = [int(budget[i] // avg_layer_bytes) if avg_layer_bytes > 0 else n_layers for i in range(n_gpu)]
-assign = [min(round(ideal[i]), max_layers_by_budget[i]) for i in range(n_gpu)]
-
-def total_assigned():
-    return sum(assign)
-
-order_fast_to_slow = sorted(range(n_gpu), key=lambda i: -speeds[i])
-guard = 0
-while total_assigned() < n_layers and guard < n_layers * 2:
-    guard += 1
-    added = False
-    for i in order_fast_to_slow:
-        if assign[i] < max_layers_by_budget[i]:
-            assign[i] += 1
-            added = True
-            if total_assigned() >= n_layers:
-                break
-    if not added:
-        break
-
-order_slow_to_fast = sorted(range(n_gpu), key=lambda i: speeds[i])
-guard = 0
-while total_assigned() > n_layers and guard < n_layers * 2:
-    guard += 1
-    for i in order_slow_to_fast:
-        if assign[i] > 0:
-            assign[i] -= 1
-            break
-    else:
-        break
-
-if total_assigned() != n_layers or any(a < 0 for a in assign):
-    sys.exit(1)
-
-print(n_layers, ",".join(str(a) for a in assign))
-' "$layer_bytes_file" "$free_mib_list" "$speed_list" "$reserve_mib"
+  /usr/local/bin/model-preset-utils.py tensor-split \
+    "$layer_bytes_file" "$free_mib_list" "$speed_list" "$reserve_mib"
 }
 
 render_preset() {

@@ -12,6 +12,7 @@ RUN apt-get update \
 COPY start-llama.sh /usr/local/bin/start-llama.sh
 COPY configure-model-preset.sh /usr/local/bin/configure-model-preset.sh
 COPY lazy-llama-proxy.py /usr/local/bin/lazy-llama-proxy.py
-RUN chmod 0755 /usr/local/bin/start-llama.sh /usr/local/bin/configure-model-preset.sh /usr/local/bin/lazy-llama-proxy.py
+COPY model-preset-utils.py /usr/local/bin/model-preset-utils.py
+RUN chmod 0755 /usr/local/bin/start-llama.sh /usr/local/bin/configure-model-preset.sh /usr/local/bin/lazy-llama-proxy.py /usr/local/bin/model-preset-utils.py
 
 ENTRYPOINT ["/usr/local/bin/start-llama.sh"]
