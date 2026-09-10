@@ -4,7 +4,7 @@ schema: v1
 models:
   - name: Local Model (llama-server)
     provider: openai
-    apiBase: http://localhost:8080/v1
+    apiBase: http://localhost:11434/v1
     apiKey: none
     model: AUTODETECT
     roles:

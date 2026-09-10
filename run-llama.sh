@@ -35,7 +35,7 @@ if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   env_args+=(-e "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
 fi
 # 以下の環境変数が設定されていればコンテナに引き継ぐ (docker/start-llama.sh 参照)
-for var in HF_ENDPOINT MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE TENSOR_SPLIT_MODE; do
+for var in PORT HF_ENDPOINT MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE TENSOR_SPLIT_MODE LLAMA_ROUTER_PORT; do
   if [[ -n "${!var:-}" ]]; then
     env_args+=(-e "$var=${!var}")
   fi
@@ -46,6 +46,6 @@ docker run --detach --name "$CONTAINER_NAME" \
   "${gpu_args[@]}" \
   "${env_args[@]}" \
   --user "$PUID:$PGID" \
-  --publish "${PORT:-8080}:${PORT:-8080}" \
+  --publish "${PORT:-11434}:${PORT:-11434}" \
   --volume "$MODEL_DIR:/models" \
   "$IMAGE_NAME"

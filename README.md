@@ -20,7 +20,9 @@ llama.cpp (llama-server) を OpenAI API 互換のエンドポイントとして 
 .
 ├── docker/
 │   ├── Dockerfile        # llama.cpp:full-cuda ベースイメージ + ラッパースクリプト
-│   └── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・preset生成・llama-server起動を行う
+│   ├── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・軽量preset生成・llama-server/proxy起動を行う
+│   ├── configure-model-preset.sh # モデル切替時に重い preset 計算を行う
+│   └── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
 ├── run-llama.sh           # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
 ├── continue/
 │   └── config.yaml        # Continue (VS Code拡張) 用のモデル設定サンプル
@@ -45,13 +47,18 @@ llama.cpp (llama-server) を OpenAI API 互換のエンドポイントとして 
 ./run-llama.sh
 ```
 
-初回実行時、指定モデルが `models/` 配下になければ Hugging Face から自動ダウンロードされ、
-`llama-bench` によるベンチマークが一度だけ実行されます(結果は `models/llama-bench-*.json` にキャッシュ)。
+初回実行時、指定モデルが `models/` 配下になければ Hugging Face から自動ダウンロードされます。
+KV キャッシュ量子化や `tensor-split` などの重い計算は起動時には全モデル分まとめて実行せず、
+リクエストされたモデルが切り替わるタイミングで対象モデルだけ再計算します。
 
-起動後は `http://localhost:8080/v1` が OpenAI 互換の API エンドポイントになります。
+起動後は `http://localhost:11434/v1` が OpenAI 互換の API エンドポイントになります。
+また、VS Code/Copilot Chat のローカルモデル検出で使われる Ollama 互換の
+`http://localhost:11434/api/tags` でも、登録済みモデル名だけを返します。
+チャット送信用に Ollama 互換の `http://localhost:11434/api/chat` (ストリーミング/非ストリーミング両対応)
+も実装しており、内部で OpenAI 互換 API に変換して `llama-server` へ転送します。
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen3.8-27B-UD-Q4_K_M",
@@ -61,6 +68,13 @@ curl http://localhost:8080/v1/chat/completions \
 
 `model` にはダウンロードした GGUF ファイル名から拡張子を除いたものを指定します
 (例: `Llama-3.2-3B-Instruct-Q4_K_M`, `Qwen3.8-27B-UD-Q4_K_M`)。
+
+### VS Code Copilot Chat で使う場合
+
+Copilot Chat では **Custom endpoint** として `http://localhost:11434/v1` (OpenAI 互換) を
+登録するのが基本です。`Local` / Ollama プロバイダを選ぶ場合は、モデル一覧の検出に
+`http://localhost:11434/api/tags`、チャット送信に `http://localhost:11434/api/chat`
+(Ollama 互換、内部で OpenAI 互換 API に変換) を使用できます。
 
 ### 2. モデルリストを変更する
 
@@ -89,7 +103,8 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
 | `IMAGE_NAME` | `my-llama-server:latest` | ビルドする Docker イメージ名 |
 | `CONTAINER_NAME` | `my-llama-server` | 作成するコンテナ名 |
 | `MODEL_DIR` | `./models` | モデルダウンロード先(ホスト側パス) |
-| `PORT` | `8080` | 公開ポート |
+| `PORT` | `11434` | 公開ポート |
+| `LLAMA_ROUTER_PORT` | `PORT + 1` | コンテナ内部の llama-server router 用ポート。通常は変更不要 |
 | `PUID` / `PGID` | 実行ユーザーの uid/gid | コンテナ内プロセスの実行ユーザー(ダウンロードファイルの権限をホストと一致させる) |
 | `CUDA_VISIBLE_DEVICES` | (未設定=全GPU) | 使用する GPU を限定したい場合に指定 |
 | `MODEL_NAMES_CSV` | (未設定) | `リポジトリ/ファイル名.gguf` のカンマ区切りリスト。指定するとスクリプト内蔵の `MODEL_NAMES` を上書き |
@@ -99,8 +114,8 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
 | `MAX_CONTEXT_SIZE` | (未設定=上限なし) | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用) |
 | `N_GPU_LAYERS` | `auto` | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる |
 | `MODELS_MAX` | `1` | 同時にロードしておくモデル数の上限(router mode) |
-| `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時は空き VRAM とモデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
-| `TENSOR_SPLIT_MODE` | `auto` | 複数 GPU 構成での層分割方法。`auto` の場合、GPU 毎の生成速度と空き VRAM を実測し、性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる |
+| `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
+| `TENSOR_SPLIT_MODE` | `auto` | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる |
 
 ## VRAM 管理の仕組み
 
@@ -110,17 +125,20 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
   自動フィット機能(`--fit`, デフォルト有効)に GPU 間のレイヤー配置やコンテキストサイズの調整を委ねています。
   これは、固定値を指定すると `--fit` が「ユーザー指定済み」と判断して調整を放棄し、VRAM に収まらない場合に
   OOM で起動失敗することがあるためです。
-- **GPU 性能比に基づく tensor-split 自動計算(`TENSOR_SPLIT_MODE=auto`、複数 GPU 時のみ)**: 起動時に一番小さい
-  モデルを使って GPU 毎の生成速度(tokens/sec)を `llama-bench` で実測し(結果はキャッシュされ、以後の起動では
+- **モデル切替時の遅延 preset 計算**: 公開ポートでは軽量プロキシがリクエストを受け、`model` が直前のモデルから
+  変わった場合だけ対象モデルの preset を再計算して llama-server router に reload します。起動時は全モデルに対して
+  KV キャッシュ量子化・GGUF テンソル解析・`tensor-split` 計算を行わないため、モデル数が増えても起動時間が伸びにくくなります。
+- **GPU 性能比に基づく tensor-split 自動計算(`TENSOR_SPLIT_MODE=auto`、複数 GPU 時のみ)**: モデル切替時に対象
+  モデルを使って GPU 毎の生成速度(tokens/sec)を `llama-bench` で実測し(結果はキャッシュされ、以後の切替では
   再利用されます)、その比率に応じてレイヤーを性能の高い GPU に多く割り当てる `tensor-split` を計算します。
   計算時には各 GPU の空き VRAM・GGUF のテンソル情報から求めたレイヤー毎の重みサイズ・KV キャッシュの
   必要量を考慮し、OOM しない範囲に収まるように按分します。予算内に収まらない場合はログに警告を出したうえで
   手動指定を諦め、通常通り `--fit` 任せの自動調整にフォールバックします(preset ファイル内で `fit = off` /
   `fit = on` を切り替えることで実現しており、コマンドライン引数側では固定しません)。
   単一 GPU の場合や `TENSOR_SPLIT_MODE=off` の場合はこの計算は行わず、常に `--fit` 任せになります。
-- **コンテキスト長の自動検出**: `CONTEXT_SIZE` を指定しない場合、`gguf-dump` を使って各モデルの GGUF メタデータから
+- **コンテキスト長の自動検出**: `CONTEXT_SIZE` を指定しない場合、モデル切替時に `gguf-dump` を使って対象モデルの GGUF メタデータから
   `<arch>.context_length`(モデルが学習時にサポートする最大コンテキスト長)を読み取り、`ctx-size` に設定します。
-- **KV キャッシュ量子化の自動選択**: `KV_CACHE_TYPE` を指定しない場合、`nvidia-smi` で取得した空き VRAM 合計から
+- **KV キャッシュ量子化の自動選択**: `KV_CACHE_TYPE` を指定しない場合、モデル切替時に `nvidia-smi` で取得した空き VRAM 合計から
   モデルファイルサイズを差し引いた「予算」を計算し、モデルの GGUF メタデータ(`block_count` /
   `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から算出した必要 KV キャッシュ量と
   比較して、予算に収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択します。
@@ -136,7 +154,7 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
 models:
   - name: Local Model (llama-server)
     provider: openai
-    apiBase: http://localhost:8080/v1
+    apiBase: http://localhost:11434/v1
     apiKey: none
     model: AUTODETECT
     roles:
