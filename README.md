@@ -103,8 +103,8 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 
 | 変数名 | デフォルト | 説明 |
 |---|---|---|
-| `IMAGE_NAME` | `my-llama-server:latest` | ビルドする Docker イメージ名 |
-| `CONTAINER_NAME` | `my-llama-server` | 作成するコンテナ名 |
+| `IMAGE_NAME` | `my-llm-server:latest` | ビルドする Docker イメージ名 |
+| `CONTAINER_NAME` | `my-llm-server` | 作成するコンテナ名 |
 | `MODEL_DIR` | `./models` | モデルダウンロード先(ホスト側パス) |
 | `PORT` | `11434` | 公開ポート |
 | `LLAMA_ROUTER_PORT` | `PORT + 1` | コンテナ内部の llama-server router 用ポート。通常は変更不要 |
@@ -119,6 +119,10 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 | `CONTEXT_SIZE_STEP` | `1024` | コンテキスト長を自動で切り詰める際の丸め単位 |
 | `N_GPU_LAYERS` | `auto` | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる |
 | `MODELS_MAX` | `1` | 同時にロードしておくモデル数の上限(router mode) |
+| `FLASH_ATTN` | `on` | Flash Attentionの使用設定。`on`/`off`/`auto`を指定可能 |
+| `BATCH_SIZE` | `1024` | prompt処理の論理バッチサイズ。llama.cpp既定値の2048より小さくして一時的なVRAM使用量を抑制 |
+| `UBATCH_SIZE` | `256` | prompt処理の物理バッチサイズ。llama.cpp既定値の512より小さくして計算バッファのVRAM使用量を抑制。`BATCH_SIZE`以下で指定 |
+| `VRAM_RESERVE_MIB` | `1536` | `--fit`と手動`tensor-split`計算でGPUごとに確保するVRAM余白(MiB) |
 | `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
 | `TENSOR_SPLIT_MODE` | `auto` | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる |
 
@@ -126,6 +130,9 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 
 - **アイドル時の自動解放**: 各モデルプロセスに `--sleep-idle-seconds` を設定しており、`MODEL_IDLE_SECONDS`
   で指定した時間アクセスが無いと自動的に VRAM を解放します。
+- **計算バッファと共有KVの省メモリ化**: Flash Attentionを有効にし、`BATCH_SIZE` / `UBATCH_SIZE`を
+  llama.cppの既定値より小さくしています。また、`--kv-unified`により並列スロット間で単一のKVバッファを共有します。
+  バッチサイズをさらに下げるとVRAMを節約できますが、長いpromptの処理速度は低下します。
 - **OOM 回避 (`--fit`)**: 基本方針として `tensor-split` や `n-gpu-layers` は固定値指定を避け、llama-server 側の
   自動フィット機能(`--fit`, デフォルト有効)に GPU 間のレイヤー配置やコンテキストサイズの調整を委ねています。
   これは、固定値を指定すると `--fit` が「ユーザー指定済み」と判断して調整を放棄し、VRAM に収まらない場合に
@@ -178,7 +185,7 @@ models:
 
 ### `500 model name=... failed to load` (OOM)
 
-- `docker logs my-llama-server` で `cudaMalloc failed: out of memory` が出ていないか確認してください。
+- `docker logs my-llm-server` で `cudaMalloc failed: out of memory` が出ていないか確認してください。
 - 通常は KV キャッシュ量子化が空き VRAM から自動選択されるため発生しにくいですが、他プロセスが GPU を
   使用中で空き VRAM が少ない場合などはそれでも収まらないことがあります。その場合は `KV_CACHE_TYPE=q4_0`
   を明示指定するか、`MAX_CONTEXT_SIZE` でコンテキスト長自体を制限してください。
@@ -191,8 +198,8 @@ models:
 ### コンテナの状態確認
 
 ```bash
-docker logs -f my-llama-server   # 起動ログ・エラーを確認
-docker ps -a --filter name=my-llama-server
+docker logs -f my-llm-server   # 起動ログ・エラーを確認
+docker ps -a --filter name=my-llm-server
 nvidia-smi                       # GPU の空き VRAM を確認
 ```
 

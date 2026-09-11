@@ -22,6 +22,12 @@ MIN_CONTEXT_SIZE="${MIN_CONTEXT_SIZE:-2048}"
 CONTEXT_SIZE_STEP="${CONTEXT_SIZE_STEP:-1024}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
+FLASH_ATTN="${FLASH_ATTN:-on}"
+# llama.cpp の既定値(2048/512)より小さくし、prompt処理用の一時VRAMを抑える。
+BATCH_SIZE="${BATCH_SIZE:-1024}"
+UBATCH_SIZE="${UBATCH_SIZE:-256}"
+# --fit と手動tensor-split計算の両方で、GPUごとに残すVRAM余白。
+VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-1536}"
 # 複数 GPU の性能差(生成速度)を考慮した tensor-split を自動計算するかどうか。
 # auto: 2 GPU 以上あり、各 GPU の生成速度比が十分な差(閾値以上)であれば手動計算した
 #       tensor-split / n-gpu-layers を明示指定する(--fit は off にする)。
@@ -47,6 +53,10 @@ die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
 [[ "$CONTEXT_SIZE_STEP" =~ ^[0-9]+$ ]] && ((CONTEXT_SIZE_STEP > 0)) || die "CONTEXT_SIZE_STEP must be a positive integer"
 [[ "$N_GPU_LAYERS" == "auto" || "$N_GPU_LAYERS" == "all" || "$N_GPU_LAYERS" =~ ^-?[0-9]+$ ]] || die "N_GPU_LAYERS must be an integer, 'auto', or 'all'"
 [[ "$MODELS_MAX" =~ ^[0-9]+$ ]] || die "MODELS_MAX must be an integer"
+[[ "$FLASH_ATTN" == "on" || "$FLASH_ATTN" == "off" || "$FLASH_ATTN" == "auto" ]] || die "FLASH_ATTN must be 'on', 'off', or 'auto'"
+[[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] && ((BATCH_SIZE > 0)) || die "BATCH_SIZE must be a positive integer"
+[[ "$UBATCH_SIZE" =~ ^[0-9]+$ ]] && ((UBATCH_SIZE > 0 && UBATCH_SIZE <= BATCH_SIZE)) || die "UBATCH_SIZE must be a positive integer no greater than BATCH_SIZE"
+[[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] && ((VRAM_RESERVE_MIB > 0)) || die "VRAM_RESERVE_MIB must be a positive integer"
 [[ "$TENSOR_SPLIT_MODE" == "auto" || "$TENSOR_SPLIT_MODE" == "off" ]] || die "TENSOR_SPLIT_MODE must be 'auto' or 'off'"
 case "$KV_CACHE_TYPE" in
   ""|f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;;
@@ -130,6 +140,11 @@ log "Available models: ${!allowed_files[*]} (models-max=$MODELS_MAX)"
 llama-server \
   --models-preset "$PRESET_FILE" \
   --models-max "$MODELS_MAX" \
+  --flash-attn "$FLASH_ATTN" \
+  --batch-size "$BATCH_SIZE" \
+  --ubatch-size "$UBATCH_SIZE" \
+  --kv-unified \
+  --fit-target "$VRAM_RESERVE_MIB" \
   --host 127.0.0.1 \
   --port "$LLAMA_ROUTER_PORT" &
 router_pid=$!
@@ -162,7 +177,7 @@ for _ in $(seq 1 60); do
 done
 ((router_ready == 1)) || die "llama-server router did not become ready"
 
-export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE TENSOR_SPLIT_MODE
+export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE
 export PRESET_FILE PRESET_SECTION_DIR MODEL_ALIAS_FILE
 export LLAMA_ROUTER_URL="http://127.0.0.1:$LLAMA_ROUTER_PORT"
 

@@ -11,6 +11,7 @@ N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
 TENSOR_SPLIT_MODE="${TENSOR_SPLIT_MODE:-auto}"
+VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-1536}"
 PRESET_FILE="${PRESET_FILE:-$MODEL_DIR/.models-preset.ini}"
 PRESET_SECTION_DIR="${PRESET_SECTION_DIR:-$MODEL_DIR/.models-preset.d}"
 MODEL_ALIAS_FILE="${MODEL_ALIAS_FILE:-$MODEL_DIR/.model-aliases.tsv}"
@@ -299,13 +300,13 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
       free_mib_list="$(detect_per_gpu_free_vram_mib)"
       params="$(detect_kv_cache_params "$model_file")"
       kv_total_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$model_ctx_size")"
-      reserve_mib="$(awk -v kv="$kv_total_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", 1024 + (kv / n) }')"
+      reserve_mib="$(awk -v base="$VRAM_RESERVE_MIB" -v kv="$kv_total_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", base + (kv / n) }')"
       result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$reserve_mib" || true)"
       if [[ -z "$result" ]]; then
         # KV 選択時の概算では収まっても、GPU ごとの重み配置と固定予約を加えると
         # tensor-split が成立しないことがある。重みだけが収まるなら --fit へ逃げず、
         # 手動配置が成立する最大のコンテキスト長を探索する。
-        model_only_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" 1024 || true)"
+        model_only_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" || true)"
         if [[ -n "$model_only_result" ]]; then
           min_step=$(( (MIN_CONTEXT_SIZE + CONTEXT_SIZE_STEP - 1) / CONTEXT_SIZE_STEP ))
           max_step=$(( model_ctx_size / CONTEXT_SIZE_STEP ))
@@ -315,7 +316,7 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
           if ((min_step <= max_step)); then
             min_ctx=$((min_step * CONTEXT_SIZE_STEP))
             min_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$min_ctx")"
-            min_reserve_mib="$(awk -v kv="$min_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", 1024 + (kv / n) }')"
+            min_reserve_mib="$(awk -v base="$VRAM_RESERVE_MIB" -v kv="$min_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", base + (kv / n) }')"
             min_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$min_reserve_mib" || true)"
             if [[ -n "$min_result" ]]; then
               low_step="$min_step"
@@ -324,7 +325,7 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
                 mid_step=$(( (low_step + high_step) / 2 ))
                 trial_ctx=$((mid_step * CONTEXT_SIZE_STEP))
                 trial_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$trial_ctx")"
-                trial_reserve_mib="$(awk -v kv="$trial_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", 1024 + (kv / n) }')"
+                trial_reserve_mib="$(awk -v base="$VRAM_RESERVE_MIB" -v kv="$trial_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", base + (kv / n) }')"
                 trial_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$trial_reserve_mib" || true)"
                 if [[ -n "$trial_result" ]]; then
                   best_ctx="$trial_ctx"
