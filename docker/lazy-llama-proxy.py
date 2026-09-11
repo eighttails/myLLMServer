@@ -335,18 +335,83 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
     def _ollama_now(self):
         return time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
 
+    def _openai_tool_call_to_ollama(self, tool_call):
+        if not isinstance(tool_call, dict):
+            return None
+
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            return None
+
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments else {}
+            except json.JSONDecodeError:
+                pass
+
+        return {
+            "function": {
+                "name": function.get("name", ""),
+                "arguments": arguments,
+            },
+        }
+
+    def _ollama_messages_to_openai(self, messages):
+        openai_messages = []
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict):
+                continue
+            openai_message = dict(message)
+            tool_calls = openai_message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                converted_tool_calls = []
+                for index, tool_call in enumerate(tool_calls):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    arguments = function.get("arguments", {})
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments)
+                    converted_tool_calls.append(
+                        {
+                            "id": tool_call.get("id") or f"call_{index}",
+                            "type": tool_call.get("type") or "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": arguments,
+                            },
+                        }
+                    )
+                openai_message["tool_calls"] = converted_tool_calls
+            openai_messages.append(openai_message)
+        return openai_messages
+
     def _openai_to_ollama_chat_response(self, model, payload, done_reason="stop"):
         choice = (payload.get("choices") or [{}])[0]
         message = choice.get("message", {})
         usage = payload.get("usage", {}) or {}
         timings = payload.get("timings", {}) or {}
+        ollama_message = {
+            "role": message.get("role", "assistant"),
+            "content": message.get("content") or "",
+        }
+        tool_calls = [
+            converted
+            for converted in (
+                self._openai_tool_call_to_ollama(tool_call)
+                for tool_call in message.get("tool_calls", [])
+            )
+            if converted is not None
+        ]
+        if tool_calls:
+            ollama_message["tool_calls"] = tool_calls
         return {
             "model": model,
             "created_at": self._ollama_now(),
-            "message": {
-                "role": message.get("role", "assistant"),
-                "content": message.get("content", ""),
-            },
+            "message": ollama_message,
             "done": True,
             "done_reason": choice.get("finish_reason") or done_reason,
             "total_duration": int(timings.get("predicted_ms", 0) * 1_000_000),
@@ -378,11 +443,16 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         stream = bool(request_payload.get("stream", True))
+        tools = request_payload.get("tools")
         openai_payload = {
             "model": model,
-            "messages": request_payload.get("messages", []),
-            "stream": stream,
+            "messages": self._ollama_messages_to_openai(request_payload.get("messages", [])),
+            "stream": stream and not tools,
         }
+        if tools:
+            openai_payload["tools"] = tools
+        if "tool_choice" in request_payload:
+            openai_payload["tool_choice"] = request_payload["tool_choice"]
         options = request_payload.get("options") or {}
         if "temperature" in options:
             openai_payload["temperature"] = options["temperature"]
@@ -398,6 +468,18 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             with self._request_backend("POST", "/v1/chat/completions", body=openai_body, headers=headers) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             self._send_json(200, self._openai_to_ollama_chat_response(model, data))
+            return
+
+        if tools:
+            with self._request_backend("POST", "/v1/chat/completions", body=openai_body, headers=headers) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write((json.dumps(self._openai_to_ollama_chat_response(model, data)) + "\n").encode("utf-8"))
+            self.wfile.flush()
+            self.close_connection = True
             return
 
         # ストリーミング応答: OpenAI の text/event-stream (SSE) を Ollama の NDJSON に変換する

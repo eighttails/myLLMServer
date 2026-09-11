@@ -55,7 +55,8 @@ KV キャッシュ量子化や `tensor-split` などの重い計算は起動時�
 また、VS Code/Copilot Chat のローカルモデル検出で使われる Ollama 互換の
 `http://localhost:11434/api/tags` でも、登録済みモデル名だけを返します。
 チャット送信用に Ollama 互換の `http://localhost:11434/api/chat` (ストリーミング/非ストリーミング両対応)
-も実装しており、内部で OpenAI 互換 API に変換して `llama-server` へ転送します。
+も実装しており、tool calling の `tools` / `tool_calls` を含めて内部で OpenAI 互換 API に変換し、
+`llama-server` へ転送します。
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
@@ -112,6 +113,8 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
 | `MODEL_IDLE_SECONDS` | `300` | この秒数アイドルが続いたモデルは VRAM から解放される |
 | `CONTEXT_SIZE` | (未設定=自動検出) | 全モデル共通のコンテキスト長を固定したい場合に指定。未指定時はモデルの GGUF メタデータ(`<arch>.context_length`)から推奨値を自動検出 |
 | `MAX_CONTEXT_SIZE` | (未設定=上限なし) | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用) |
+| `MIN_CONTEXT_SIZE` | `2048` | KV キャッシュが VRAM に収まらず自動でコンテキスト長を切り詰める際の下限。これを下回る場合のみ `--fit` にフォールバックする |
+| `CONTEXT_SIZE_STEP` | `1024` | コンテキスト長を自動で切り詰める際の丸め単位 |
 | `N_GPU_LAYERS` | `auto` | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる |
 | `MODELS_MAX` | `1` | 同時にロードしておくモデル数の上限(router mode) |
 | `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
@@ -142,8 +145,12 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
   モデルファイルサイズを差し引いた「予算」を計算し、モデルの GGUF メタデータ(`block_count` /
   `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から算出した必要 KV キャッシュ量と
   比較して、予算に収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択します。
-  それでも収まらない場合は `q4_0` にフォールバックします。VRAM が非常に少ない環境では `MAX_CONTEXT_SIZE` も
-  併用してコンテキスト長自体を制限してください。
+- **コンテキスト長の自動切り詰め**: 最も軽い `q4_0` でも KV キャッシュが予算に収まらない場合は、`--fit` に
+  切り替えるのではなく `q4_0` のまま予算に収まるところまで `ctx-size` を切り詰めます(`CONTEXT_SIZE_STEP`
+  の倍数に丸め、`MIN_CONTEXT_SIZE` を下限とします)。KV キャッシュの概算では収まっていても、GPU ごとの
+  重み配置と固定予約を含めると `tensor-split` が成立しない場合も、成立する最大のコンテキスト長を探索します。
+  モデルの重み自体が空き VRAM に収まらない場合のみ、KV キャッシュ・`tensor-split` の手動指定を諦めて
+  `--fit` 任せにフォールバックします。
 
 ## Continue (VS Code拡張) との連携
 
