@@ -1,6 +1,7 @@
 # myLLMServer
 
-llama.cpp (llama-server) を OpenAI API 互換のエンドポイントとして Docker コンテナ上で動かすためのラッパーです。
+llama.cpp (llama-server) を Ollama API 互換および OpenAI API 互換のエンドポイントとして
+Docker コンテナ上で動かすためのラッパーです。
 複数の GGUF モデルをルーターモード (router mode) で切り替えながら提供し、一定時間使われていないモデルは
 自動的に VRAM から解放されます。
 
@@ -13,6 +14,8 @@ llama.cpp (llama-server) を OpenAI API 互換のエンドポイントとして 
 - 一定時間(デフォルト5分、環境変数で変更可)アイドルなモデルは VRAM を自動解放
 - ホスト側の UID/GID でコンテナを実行するため、ダウンロードしたモデルファイルをホスト側から root 権限なしに削除可能
 - モデルの GGUF メタデータから推奨コンテキスト長を自動検出し、GPU の空き VRAM に応じて自動フィット(OOM 回避)
+- Ollama API 互換エンドポイントを提供し、ollama-vscode拡張機能から VS Code 上で利用可能
+- OpenAI API 互換エンドポイントを提供し、Continue拡張機能から VS Code 上で利用可能
 
 ## 構成
 
@@ -23,7 +26,7 @@ llama.cpp (llama-server) を OpenAI API 互換のエンドポイントとして 
 │   ├── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・軽量preset生成・llama-server/proxy起動を行う
 │   ├── configure-model-preset.sh # モデル切替時に重い preset 計算を行う
 │   └── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
-├── run-llama.sh           # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
+├── launch.sh              # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
 ├── continue/
 │   └── config.yaml        # Continue (VS Code拡張) 用のモデル設定サンプル
 └── models/                # モデルダウンロード先 (.gitignore 済み、初回は空でOK)
@@ -44,7 +47,7 @@ llama.cpp (llama-server) を OpenAI API 互換のエンドポイントとして 
 - `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf`
 
 ```bash
-./run-llama.sh
+./launch.sh
 ```
 
 初回実行時、指定モデルが `models/` 配下になければ Hugging Face から自動ダウンロードされます。
@@ -70,12 +73,11 @@ curl http://localhost:11434/v1/chat/completions \
 `model` にはダウンロードした GGUF ファイル名から拡張子を除いたものを指定します
 (例: `Llama-3.2-3B-Instruct-Q4_K_M`, `Qwen3.8-27B-UD-Q4_K_M`)。
 
-### VS Code Copilot Chat で使う場合
+### ollama-vscode拡張機能から使う場合
 
-Copilot Chat では **Custom endpoint** として `http://localhost:11434/v1` (OpenAI 互換) を
-登録するのが基本です。`Local` / Ollama プロバイダを選ぶ場合は、モデル一覧の検出に
-`http://localhost:11434/api/tags`、チャット送信に `http://localhost:11434/api/chat`
-(Ollama 互換、内部で OpenAI 互換 API に変換) を使用できます。
+本サーバーは、モデル一覧取得の `GET /api/tags` とチャット送信の `POST /api/chat` を実装しています。
+ollama-vscode拡張機能の Ollama 接続先を `http://localhost:11434` に設定すると、登録済みモデルを選択して
+VS Code 上から利用できます。チャットはストリーミング/非ストリーミングと tool calling に対応しています。
 
 ### 2. モデルリストを変更する
 
@@ -84,20 +86,20 @@ Copilot Chat では **Custom endpoint** として `http://localhost:11434/v1` (O
 このリストにないモデルファイルが `models/` にキャッシュされていた場合は起動時に自動削除されます。
 
 ```bash
-MODEL_NAMES_CSV="bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf" ./run-llama.sh
+MODEL_NAMES_CSV="bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf" ./launch.sh
 ```
 
 ### 3. モデル保存先を変更する
 
 ```bash
-MODEL_DIR=/path/to/your/models ./run-llama.sh
+MODEL_DIR=/path/to/your/models ./launch.sh
 ```
 
 未指定の場合は `./models` が使われます。
 
 ## 環境変数一覧
 
-`run-llama.sh` 実行前に環境変数を export しておくと、コンテナに引き継がれます。
+`launch.sh` 実行前に環境変数を export しておくと、コンテナに引き継がれます。
 
 | 変数名 | デフォルト | 説明 |
 |---|---|---|
@@ -154,7 +156,9 @@ MODEL_DIR=/path/to/your/models ./run-llama.sh
 
 ## Continue (VS Code拡張) との連携
 
-[continue/config.yaml](continue/config.yaml) に本サーバーを OpenAI 互換プロバイダとして登録するサンプル設定があります。
+本サーバーは OpenAI API 互換の `GET /v1/models` と `POST /v1/chat/completions` を提供するため、
+Continueの `openai` プロバイダから利用できます。
+[continue/config.yaml](continue/config.yaml) に本サーバーを OpenAI API 互換プロバイダとして登録するサンプル設定があります。
 `~/.continue/config.yaml` にコピーして使用してください。
 
 ```yaml
@@ -194,10 +198,10 @@ nvidia-smi                       # GPU の空き VRAM を確認
 
 ## 再ビルド・再起動
 
-`run-llama.sh` はイメージの再ビルドと既存コンテナの削除・再作成を毎回行います。
+`launch.sh` はイメージの再ビルドと既存コンテナの削除・再作成を毎回行います。
 スクリプトを修正した場合や設定を変更した場合は、変更したい環境変数を export した上で再実行してください。
 
 ```bash
 export KV_CACHE_TYPE=q4_0
-./run-llama.sh
+./launch.sh
 ```
