@@ -17,6 +17,9 @@ LLAMA_ROUTER_PORT="${LLAMA_ROUTER_PORT:-$((PORT + 1))}"
 # MAX_CONTEXT_SIZE を指定すると、自動検出値に上限(VRAM保護用)をかけられる。
 CONTEXT_SIZE="${CONTEXT_SIZE:-}"
 MAX_CONTEXT_SIZE="${MAX_CONTEXT_SIZE:-}"
+# KV キャッシュが VRAM に収まらない場合の自動切り詰めの下限と丸め単位。
+MIN_CONTEXT_SIZE="${MIN_CONTEXT_SIZE:-2048}"
+CONTEXT_SIZE_STEP="${CONTEXT_SIZE_STEP:-1024}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
 # 複数 GPU の性能差(生成速度)を考慮した tensor-split を自動計算するかどうか。
@@ -40,6 +43,8 @@ die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
 [[ "$LLAMA_ROUTER_PORT" != "$PORT" ]] || die "LLAMA_ROUTER_PORT must be different from PORT"
 [[ -z "$CONTEXT_SIZE" || "$CONTEXT_SIZE" =~ ^[0-9]+$ ]] || die "CONTEXT_SIZE must be an integer"
 [[ -z "$MAX_CONTEXT_SIZE" || "$MAX_CONTEXT_SIZE" =~ ^[0-9]+$ ]] || die "MAX_CONTEXT_SIZE must be an integer"
+[[ "$MIN_CONTEXT_SIZE" =~ ^[0-9]+$ ]] && ((MIN_CONTEXT_SIZE > 0)) || die "MIN_CONTEXT_SIZE must be a positive integer"
+[[ "$CONTEXT_SIZE_STEP" =~ ^[0-9]+$ ]] && ((CONTEXT_SIZE_STEP > 0)) || die "CONTEXT_SIZE_STEP must be a positive integer"
 [[ "$N_GPU_LAYERS" == "auto" || "$N_GPU_LAYERS" == "all" || "$N_GPU_LAYERS" =~ ^-?[0-9]+$ ]] || die "N_GPU_LAYERS must be an integer, 'auto', or 'all'"
 [[ "$MODELS_MAX" =~ ^[0-9]+$ ]] || die "MODELS_MAX must be an integer"
 [[ "$TENSOR_SPLIT_MODE" == "auto" || "$TENSOR_SPLIT_MODE" == "off" ]] || die "TENSOR_SPLIT_MODE must be 'auto' or 'off'"
@@ -157,7 +162,7 @@ for _ in $(seq 1 60); do
 done
 ((router_ready == 1)) || die "llama-server router did not become ready"
 
-export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE TENSOR_SPLIT_MODE
+export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX KV_CACHE_TYPE TENSOR_SPLIT_MODE
 export PRESET_FILE PRESET_SECTION_DIR MODEL_ALIAS_FILE
 export LLAMA_ROUTER_URL="http://127.0.0.1:$LLAMA_ROUTER_PORT"
 

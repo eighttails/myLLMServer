@@ -5,6 +5,8 @@ MODEL_DIR="${MODEL_DIR:-/models}"
 MODEL_IDLE_SECONDS="${MODEL_IDLE_SECONDS:-300}"
 CONTEXT_SIZE="${CONTEXT_SIZE:-}"
 MAX_CONTEXT_SIZE="${MAX_CONTEXT_SIZE:-}"
+MIN_CONTEXT_SIZE="${MIN_CONTEXT_SIZE:-2048}"
+CONTEXT_SIZE_STEP="${CONTEXT_SIZE_STEP:-1024}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
@@ -93,6 +95,8 @@ kv_cache_type_bytes_per_element() {
   esac
 }
 
+# "<kv-cache-type> <ctx-size>" を返す。モデル本体すら VRAM に収まらない場合は
+# 空文字を返し、呼び出し側で llama-server の --fit に委ねる。
 select_kv_cache_type() {
   local model_file="$1" ctx_size="$2" free_bytes="$3"
   local params block_count head_count_kv key_length value_length
@@ -107,6 +111,11 @@ select_kv_cache_type() {
   local model_bytes budget_bytes
   model_bytes="$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)"
   budget_bytes="$(awk -v f="$free_bytes" -v m="$model_bytes" 'BEGIN { b = (f - m) * 0.9; if (b < 0) b = 0; printf "%.0f", b }')"
+  if ((budget_bytes <= 0)); then
+    log "$(basename "$model_file"): model weights alone exceed free VRAM; falling back to --fit"
+    echo ""
+    return
+  fi
 
   local candidate bytes_per_elem needed_bytes
   for candidate in f16 q8_0 q4_0; do
@@ -116,12 +125,32 @@ select_kv_cache_type() {
       'BEGIN { printf "%.0f", bc * hkv * (kl + vl) * ctx * bpe }')"
     if (( $(awk -v n="$needed_bytes" -v b="$budget_bytes" 'BEGIN { print (n <= b) ? 1 : 0 }') )); then
       log "$(basename "$model_file"): estimated KV cache for $candidate = $((needed_bytes / 1024 / 1024)) MiB (budget $((budget_bytes / 1024 / 1024)) MiB) -> selected"
-      echo "$candidate"
+      printf '%s %s\n' "$candidate" "$ctx_size"
       return
     fi
     log "$(basename "$model_file"): estimated KV cache for $candidate = $((needed_bytes / 1024 / 1024)) MiB exceeds budget $((budget_bytes / 1024 / 1024)) MiB"
   done
-  echo "q4_0"
+
+  # 最も軽い q4_0 でも収まらない場合は、--fit に切り替えるのではなく
+  # 予算に収まるところまで ctx-size を切り詰める。
+  local fitted_ctx
+  bytes_per_elem="$(kv_cache_type_bytes_per_element q4_0)"
+  fitted_ctx="$(awk -v bc="$block_count" -v hkv="$head_count_kv" -v kl="$key_length" -v vl="$value_length" \
+    -v b="$budget_bytes" -v bpe="$bytes_per_elem" -v step="$CONTEXT_SIZE_STEP" \
+    'BEGIN {
+       per_token = bc * hkv * (kl + vl) * bpe
+       if (per_token <= 0) { print 0; exit }
+       ctx = int(b / per_token)
+       ctx = int(ctx / step) * step
+       print ctx
+     }')"
+  if [[ "$fitted_ctx" =~ ^[0-9]+$ ]] && ((fitted_ctx >= MIN_CONTEXT_SIZE)); then
+    log "$(basename "$model_file"): shrinking ctx-size from $ctx_size to $fitted_ctx to fit q4_0 KV cache in VRAM"
+    printf '%s %s\n' q4_0 "$fitted_ctx"
+    return
+  fi
+  log "$(basename "$model_file"): cannot fit q4_0 KV cache even at MIN_CONTEXT_SIZE=$MIN_CONTEXT_SIZE; falling back to --fit"
+  echo ""
 }
 
 detect_total_free_vram_bytes() {
@@ -192,6 +221,20 @@ calculate_tensor_split() {
     "$layer_bytes_file" "$free_mib_list" "$speed_list" "$reserve_mib"
 }
 
+estimate_kv_cache_mib() {
+  local params="$1" cache_type="$2" ctx_size="$3"
+  if [[ -z "$params" || -z "$cache_type" ]]; then
+    echo 0
+    return
+  fi
+
+  local bc hkv kl vl bpe
+  read -r bc hkv kl vl <<< "$params"
+  bpe="$(kv_cache_type_bytes_per_element "$cache_type")"
+  awk -v bc="$bc" -v hkv="$hkv" -v kl="$kl" -v vl="$vl" -v ctx="$ctx_size" -v bpe="$bpe" \
+    'BEGIN { printf "%.0f", (bc * hkv * (kl + vl) * ctx * bpe) / 1024 / 1024 }'
+}
+
 render_preset() {
   local tmp
   tmp="$(mktemp "$PRESET_FILE.tmp.XXXXXX")"
@@ -223,12 +266,20 @@ if [[ -n "$MAX_CONTEXT_SIZE" ]] && ((model_ctx_size > MAX_CONTEXT_SIZE)); then
 fi
 
 model_kv_cache_type="$KV_CACHE_TYPE"
+model_fit_fallback=0
 total_free_vram_bytes="$(detect_total_free_vram_bytes)"
 if [[ -z "$model_kv_cache_type" ]]; then
   if ((total_free_vram_bytes > 0)); then
-    model_kv_cache_type="$(select_kv_cache_type "$model_file" "$model_ctx_size" "$total_free_vram_bytes")"
-    if [[ -n "$model_kv_cache_type" ]]; then
+    kv_selection="$(select_kv_cache_type "$model_file" "$model_ctx_size" "$total_free_vram_bytes")"
+    if [[ -n "$kv_selection" ]]; then
+      read -r model_kv_cache_type fitted_ctx_size <<< "$kv_selection"
+      if [[ "$fitted_ctx_size" =~ ^[0-9]+$ ]] && ((fitted_ctx_size != model_ctx_size)); then
+        log "Adjusted ctx-size for $filename: $model_ctx_size -> $fitted_ctx_size"
+        model_ctx_size="$fitted_ctx_size"
+      fi
       log "Auto-selected KV cache type for $filename: $model_kv_cache_type"
+    else
+      model_fit_fallback=1
     fi
   else
     log "Could not detect free VRAM; leaving KV cache type at llama-server default (f16) for $filename"
@@ -237,7 +288,9 @@ fi
 
 model_tensor_split=""
 model_n_gpu_layers_fixed=""
-if [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
+if [[ "$model_fit_fallback" == 1 ]]; then
+  log "Model weights do not fit in free VRAM for $filename; relying on llama-server's --fit auto-adjustment"
+elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
   gpu_tg_speeds="$(detect_per_gpu_tg_speed "$model_file")"
   if [[ -n "$gpu_tg_speeds" ]]; then
     log "Per-GPU generation speed (tok/s): $(tr '\n' ' ' <<< "$gpu_tg_speeds")"
@@ -245,20 +298,61 @@ if [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
     if detect_layer_bytes "$model_file" > "$layer_bytes_file" && [[ -s "$layer_bytes_file" ]]; then
       free_mib_list="$(detect_per_gpu_free_vram_mib)"
       params="$(detect_kv_cache_params "$model_file")"
-      kv_total_mib=0
-      if [[ -n "$params" && -n "$model_kv_cache_type" ]]; then
-        read -r bc hkv kl vl <<< "$params"
-        bpe="$(kv_cache_type_bytes_per_element "$model_kv_cache_type")"
-        kv_total_mib="$(awk -v bc="$bc" -v hkv="$hkv" -v kl="$kl" -v vl="$vl" -v ctx="$model_ctx_size" -v bpe="$bpe" \
-          'BEGIN { printf "%.0f", (bc * hkv * (kl + vl) * ctx * bpe) / 1024 / 1024 }')"
-      fi
+      kv_total_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$model_ctx_size")"
       reserve_mib="$(awk -v kv="$kv_total_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", 1024 + (kv / n) }')"
       result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$reserve_mib" || true)"
+      if [[ -z "$result" ]]; then
+        # KV 選択時の概算では収まっても、GPU ごとの重み配置と固定予約を加えると
+        # tensor-split が成立しないことがある。重みだけが収まるなら --fit へ逃げず、
+        # 手動配置が成立する最大のコンテキスト長を探索する。
+        model_only_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" 1024 || true)"
+        if [[ -n "$model_only_result" ]]; then
+          min_step=$(( (MIN_CONTEXT_SIZE + CONTEXT_SIZE_STEP - 1) / CONTEXT_SIZE_STEP ))
+          max_step=$(( model_ctx_size / CONTEXT_SIZE_STEP ))
+          best_ctx=0
+          best_result=""
+
+          if ((min_step <= max_step)); then
+            min_ctx=$((min_step * CONTEXT_SIZE_STEP))
+            min_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$min_ctx")"
+            min_reserve_mib="$(awk -v kv="$min_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", 1024 + (kv / n) }')"
+            min_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$min_reserve_mib" || true)"
+            if [[ -n "$min_result" ]]; then
+              low_step="$min_step"
+              high_step="$max_step"
+              while ((low_step <= high_step)); do
+                mid_step=$(( (low_step + high_step) / 2 ))
+                trial_ctx=$((mid_step * CONTEXT_SIZE_STEP))
+                trial_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$trial_ctx")"
+                trial_reserve_mib="$(awk -v kv="$trial_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", 1024 + (kv / n) }')"
+                trial_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$trial_reserve_mib" || true)"
+                if [[ -n "$trial_result" ]]; then
+                  best_ctx="$trial_ctx"
+                  best_result="$trial_result"
+                  low_step=$((mid_step + 1))
+                else
+                  high_step=$((mid_step - 1))
+                fi
+              done
+            fi
+          fi
+
+          if [[ -n "$best_result" ]]; then
+            log "Shrinking ctx-size for $filename from $model_ctx_size to $best_ctx to enable manual tensor-split"
+            model_ctx_size="$best_ctx"
+            result="$best_result"
+          else
+            log "Manual tensor-split cannot fit at MIN_CONTEXT_SIZE=$MIN_CONTEXT_SIZE; falling back to --fit"
+          fi
+        else
+          log "Model weights cannot fit with the per-GPU reserve; falling back to --fit"
+        fi
+      fi
       if [[ -n "$result" ]]; then
         read -r model_n_gpu_layers_fixed model_tensor_split <<< "$result"
         log "Calculated tensor-split for $filename: n-gpu-layers=$model_n_gpu_layers_fixed tensor-split=$model_tensor_split"
       else
-        log "Could not fit a manual tensor-split for $filename within free VRAM; falling back to --fit"
+        log "Could not fit a manual tensor-split for $filename within free VRAM"
       fi
     else
       log "Could not determine per-layer tensor sizes for $filename; falling back to --fit"

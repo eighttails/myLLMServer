@@ -130,12 +130,14 @@ def calculate_tensor_split(
     guard = 0
     while total_assigned() < layer_count and guard < layer_count * 2:
         guard += 1
+        assigned = False
         for index in fastest_to_slowest:
             if assignments[index] < max_layers_by_budget[index]:
                 assignments[index] += 1
+                assigned = True
                 if total_assigned() >= layer_count:
                     break
-        else:
+        if not assigned:
             break
 
     slowest_to_fastest = sorted(range(gpu_count), key=lambda index: speeds[index])
