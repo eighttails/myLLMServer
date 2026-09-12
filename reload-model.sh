@@ -7,20 +7,52 @@ MODEL_DIR="${MODEL_DIR:-$SCRIPT_DIR/models}"
 MODEL_LIST_FILE="${MODEL_LIST_FILE:-$SCRIPT_DIR/model_list.txt}"
 MODEL_LIST_EXAMPLE="${MODEL_LIST_EXAMPLE:-$SCRIPT_DIR/model_list.example}"
 
+log() { printf '%s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+cleanup_unused_models() {
+  local model_spec repo filename cached_file
+  declare -A allowed_files=()
+
+  while IFS= read -r model_spec; do
+    [[ "$model_spec" =~ ^[[:space:]]*# || "$model_spec" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$model_spec" == */* ]] || die "invalid model spec: $model_spec"
+    repo="${model_spec%/*}"
+    filename="${model_spec##*/}"
+    [[ -n "$repo" ]] || die "invalid model spec: $model_spec"
+    [[ "$filename" == *.gguf ]] || die "model must be a .gguf file: $model_spec"
+    allowed_files["$filename"]=1
+  done < "$MODEL_LIST_FILE"
+
+  ((${#allowed_files[@]} > 0)) || die "no valid model entries found in $MODEL_LIST_FILE"
+
+  shopt -s nullglob
+  for cached_file in "$MODEL_DIR"/*.gguf; do
+    filename="$(basename "$cached_file")"
+    if [[ -z "${allowed_files[$filename]+x}" ]]; then
+      log "Removing model not in model_list: $cached_file"
+      rm -f -- "$cached_file"
+      rm -f -- "$cached_file.part"
+      rm -f -- "$MODEL_DIR/llama-bench-$filename.json"
+    fi
+  done
+  shopt -u nullglob
+}
+
 # model_list.txt がなければ model_list.example からコピーする
 if [[ ! -f "$MODEL_LIST_FILE" ]]; then
-  echo "model list file not found: $MODEL_LIST_FILE" >&2
+  log "model list file not found: $MODEL_LIST_FILE"
   if [[ -f "$MODEL_LIST_EXAMPLE" ]]; then
-    echo "copying from example: $MODEL_LIST_EXAMPLE" >&2
+    log "copying from example: $MODEL_LIST_EXAMPLE"
     cp "$MODEL_LIST_EXAMPLE" "$MODEL_LIST_FILE"
   else
-    echo "error: example model list file not found: $MODEL_LIST_EXAMPLE" >&2
-    exit 1
+    die "example model list file not found: $MODEL_LIST_EXAMPLE"
   fi
 fi
 
 mkdir -p "$MODEL_DIR"
 cp "$MODEL_LIST_FILE" "$MODEL_DIR/model_list.txt"
+cleanup_unused_models
 
 # コンテナが起動中であれば、コンテナ内で sync-model.sh を実行する
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1 && \
