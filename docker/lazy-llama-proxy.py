@@ -120,6 +120,9 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         self._handle()
 
     def log_message(self, fmt, *args):
+        parsed_path = urllib.parse.urlsplit(self.path).path if getattr(self, "path", None) else ""
+        if parsed_path == "/api/ps":
+            return
         sys.stderr.write("[llama-proxy] " + fmt % args + "\n")
 
     def _read_body(self):
