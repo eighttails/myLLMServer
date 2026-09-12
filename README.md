@@ -29,6 +29,7 @@ Docker コンテナ上で動かすためのラッパーです。
 │   └── unload-model.sh           # コンテナ内からモデルをアンロードするスクリプト
 ├── launch.sh              # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
 ├── unload.sh              # 外部(ホスト側)からモデルをアンロードするスクリプト
+├── reload-models.sh       # model_list.txt を再ロードし、新規モデルの追加ダウンロード＆不要モデルの削除を行うスクリプト
 ├── model_list.txt         # 使用するモデルの指定ファイル (初回起動時に model_list.example から自動作成)
 ├── model_list.example     # モデル指定ファイルのサンプル
 ├── continue/
@@ -90,8 +91,22 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 <Hugging Face リポジトリ名>/<ファイル名>.gguf
 ```
 
-編集後、`./launch.sh` を再実行すると設定が反映されます。
-なお、リストに含まれていないキャッシュ済みモデル（`models/` 配下の `.gguf` ファイル）は、起動時に自動削除されます。
+編集後、コンテナを再起動せずに `model_list.txt` を再ロードして変更を即座に反映したい場合は、`./reload-models.sh` を実行します。
+
+```bash
+./reload-models.sh
+```
+
+このコマンド（または `./launch.sh`）を実行すると、以下の処理が自動で行われます:
+- `model_list.txt` に新たに追加されたモデルを Hugging Face から自動ダウンロード
+- インストール済みだが `model_list.txt` に記載のない（今後使わない）モデルをディスク（`models/`）から自動削除
+- サーバー（llama-server および プロキシ）のモデルリストを即座に更新
+
+また、HTTP API 経由で再ロードをトリガーすることも可能です。
+
+```bash
+curl -X POST http://localhost:11434/models/reload
+```
 
 一時的に環境変数でモデルを指定したい場合は、`MODEL_NAMES_CSV` を直接指定して起動することも可能です。
 

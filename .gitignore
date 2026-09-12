@@ -1,2 +1,4 @@
 models
 model_list.txt
+__pycache__
+*.pyc

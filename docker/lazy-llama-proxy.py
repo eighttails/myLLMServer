@@ -33,8 +33,34 @@ class LazyProxy(http.server.ThreadingHTTPServer):
         self.backend = backend.rstrip("/")
         self.active_model = None
         self.model_lock = threading.Lock()
-        self.model_entries = self._load_model_entries()
-        self.model_aliases = self._load_model_aliases(self.model_entries)
+        self.alias_file_mtime = 0
+        self.model_entries = []
+        self.model_aliases = {}
+        self.reload_model_entries()
+
+    def reload_model_entries(self):
+        alias_file = os.environ.get("MODEL_ALIAS_FILE")
+        if alias_file and os.path.exists(alias_file):
+            try:
+                self.alias_file_mtime = os.path.getmtime(alias_file)
+            except OSError:
+                self.alias_file_mtime = 0
+        entries = self._load_model_entries()
+        aliases = self._load_model_aliases(entries)
+        self.model_entries = entries
+        self.model_aliases = aliases
+        if self.active_model and self.active_model not in self.model_aliases:
+            self.active_model = None
+
+    def ensure_model_entries_up_to_date(self):
+        alias_file = os.environ.get("MODEL_ALIAS_FILE")
+        if alias_file and os.path.exists(alias_file):
+            try:
+                current_mtime = os.path.getmtime(alias_file)
+            except OSError:
+                current_mtime = 0
+            if current_mtime != self.alias_file_mtime:
+                self.reload_model_entries()
 
     def _load_model_entries(self):
         entries = []
@@ -598,7 +624,34 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
 
+    def _handle_reload(self, body):
+        with self.server.model_lock:
+            self.log_message("reloading model list from model_list.txt / MODEL_NAMES_CSV...")
+            try:
+                subprocess.run(
+                    ["/usr/local/bin/sync-models.sh"],
+                    check=True,
+                    env=os.environ.copy(),
+                )
+            except subprocess.CalledProcessError as err:
+                self.log_message("failed to sync models: %s", err)
+                self._send_error_json(500, f"failed to sync models: {err}")
+                return
+
+            self.server.reload_model_entries()
+            models_list = [entry["alias"] for entry in self.server.model_entries]
+            self.log_message("model list reloaded successfully. active models: %s", models_list)
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "message": "model_list reloaded and synchronized successfully",
+                    "models": models_list,
+                },
+            )
+
     def _handle(self):
+        self.server.ensure_model_entries_up_to_date()
         body = self._read_body()
         model = self._extract_model(body)
         canonical_model = self.server.model_aliases.get(model, model) if model else None
@@ -615,6 +668,9 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             if self.command == "POST" and parsed_path == "/api/show":
                 self._send_ollama_show(model)
+                return
+            if parsed_path in {"/models/reload", "/api/reload", "/v1/models/reload", "/v1/reload", "/reload"}:
+                self._handle_reload(body)
                 return
             if parsed_path in {"/models/unload", "/api/unload", "/v1/models/unload", "/v1/unload"}:
                 self._handle_unload(body)

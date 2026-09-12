@@ -15,6 +15,7 @@ PGID="${PGID:-$(id -g)}"
 
 mkdir -p "$MODEL_DIR"
 chmod 0755 "$MODEL_DIR"
+cp "$MODEL_LIST_FILE" "$MODEL_DIR/model_list.txt"
 
 # model_list.txt からモデルリストを読み込む (コメント行・空行は無視、カンマ区切りで結合)
 MODEL_NAMES_CSV="$(awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/' "$MODEL_LIST_FILE" | tr '\n' ',' | sed 's/,$//')"
