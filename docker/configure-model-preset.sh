@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-/models}"
-MODEL_IDLE_SECONDS="${MODEL_IDLE_SECONDS:-300}"
+MODEL_IDLE_SECONDS="${MODEL_IDLE_SECONDS:-1800}"
 CONTEXT_SIZE="${CONTEXT_SIZE:-}"
 MAX_CONTEXT_SIZE="${MAX_CONTEXT_SIZE:-}"
 MIN_CONTEXT_SIZE="${MIN_CONTEXT_SIZE:-2048}"
@@ -452,10 +452,9 @@ tmp_section="$(mktemp "$section_file.tmp.XXXXXX")"
   if [[ -n "$model_n_cpu_moe" ]] && ((model_n_cpu_moe > 0)); then
     printf 'n-cpu-moe = %s\n' "$model_n_cpu_moe"
   fi
-  if [[ -n "$model_kv_cache_type" ]]; then
-    printf 'cache-type-k = %s\n' "$model_kv_cache_type"
-    printf 'cache-type-v = %s\n' "$model_kv_cache_type"
-  fi
+  kv_type="${model_kv_cache_type:-${KV_CACHE_TYPE:-f16}}"
+  printf 'cache-type-k = %s\n' "$kv_type"
+  printf 'cache-type-v = %s\n' "$kv_type"
   printf '\n'
 } > "$tmp_section"
 mv "$tmp_section" "$section_file"

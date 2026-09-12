@@ -560,10 +560,45 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
         self.close_connection = True
 
+    def _handle_unload(self, body):
+        model = self._extract_model(body)
+        canonical_model = self.server.model_aliases.get(model, model) if model else None
+        target_model = canonical_model or self.server.active_model
+
+        with self.server.model_lock:
+            if not target_model:
+                self._send_json(200, {"status": "ok", "message": "no active model to unload"})
+                return
+
+            self.log_message("unloading model via API request: %s", target_model)
+            try:
+                self._backend_json("POST", "/models/unload", {"model": target_model})
+            except urllib.error.HTTPError as err:
+                if err.code != 400:
+                    raise
+                self.log_message(
+                    "model already unloaded (ignoring 400 from /models/unload): %s",
+                    target_model,
+                )
+            else:
+                self._wait_until_unloaded(target_model)
+
+            if target_model == self.server.active_model:
+                self.server.active_model = None
+
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "message": f"model '{target_model}' unloaded successfully",
+                    "unloaded_model": target_model,
+                },
+            )
+
     def _handle(self):
         body = self._read_body()
         model = self._extract_model(body)
-        canonical_model = self.server.model_aliases.get(model, model)
+        canonical_model = self.server.model_aliases.get(model, model) if model else None
         parsed_path = urllib.parse.urlsplit(self.path).path
         try:
             if self.command == "GET" and parsed_path == "/api/tags":
@@ -578,14 +613,14 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             if self.command == "POST" and parsed_path == "/api/show":
                 self._send_ollama_show(model)
                 return
-            if parsed_path != "/models/unload":
-                self._prepare_model_if_needed(model)
+            if parsed_path in {"/models/unload", "/api/unload", "/v1/models/unload", "/v1/unload"}:
+                self._handle_unload(body)
+                return
+            self._prepare_model_if_needed(model)
             if self.command == "POST" and parsed_path == "/api/chat":
                 self._handle_ollama_chat(body, canonical_model or model)
                 return
             self._forward(body)
-            if parsed_path == "/models/unload" and canonical_model == self.server.active_model:
-                self.server.active_model = None
         except subprocess.CalledProcessError as err:
             self.log_message("failed to prepare model preset: %s", err)
             self._send_error_json(502, f"failed to prepare model preset for {model}")

@@ -8,7 +8,7 @@ MODEL_NAMES=()
 MODEL_DIR="${MODEL_DIR:-/models}"
 MODEL_NAMES_CSV="${MODEL_NAMES_CSV:-}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
-MODEL_IDLE_SECONDS="${MODEL_IDLE_SECONDS:-300}"
+MODEL_IDLE_SECONDS="${MODEL_IDLE_SECONDS:-1800}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-11434}"
 LLAMA_ROUTER_PORT="${LLAMA_ROUTER_PORT:-$((PORT + 1))}"
@@ -131,10 +131,9 @@ for model_spec in "${MODEL_NAMES[@]}"; do
     printf 'sleep-idle-seconds = %s\n' "$MODEL_IDLE_SECONDS"
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
     printf 'ctx-size = %s\n' "$advertised_context_size"
-    if [[ -n "$KV_CACHE_TYPE" ]]; then
-      printf 'cache-type-k = %s\n' "$KV_CACHE_TYPE"
-      printf 'cache-type-v = %s\n' "$KV_CACHE_TYPE"
-    fi
+    kv_type="${KV_CACHE_TYPE:-f16}"
+    printf 'cache-type-k = %s\n' "$kv_type"
+    printf 'cache-type-v = %s\n' "$kv_type"
     printf '\n'
   } > "$PRESET_SECTION_DIR/$alias_name.ini"
 done

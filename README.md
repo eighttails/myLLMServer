@@ -8,10 +8,10 @@ Docker コンテナ上で動かすためのラッパーです。
 ## 特徴
 
 - ホスト環境には Docker 以外の追加インストールが不要(モデルのダウンロード・配置もコンテナ内で完結)
-- `MODEL_NAMES_CSV` で指定した Hugging Face 上の GGUF モデルをコマンドラインだけでダウンロード・配置
+- `model_list.txt` で指定した Hugging Face 上の GGUF モデルを自動ダウンロード・配置
 - リストにないモデル(キャッシュ済みファイル)は起動時に自動削除
 - `CUDA_VISIBLE_DEVICES` を参照し、未設定なら全 GPU を使用
-- 一定時間(デフォルト5分、環境変数で変更可)アイドルなモデルは VRAM を自動解放
+- 一定時間(デフォルト30分、環境変数で変更可)アイドルなモデルは VRAM を自動解放
 - ホスト側の UID/GID でコンテナを実行するため、ダウンロードしたモデルファイルをホスト側から root 権限なしに削除可能
 - モデルの GGUF メタデータから推奨コンテキスト長を自動検出し、GPU の空き VRAM に応じて自動フィット(OOM 回避)
 - Ollama API 互換エンドポイントを提供し、ollama-vscode拡張機能から VS Code 上で利用可能
@@ -25,8 +25,12 @@ Docker コンテナ上で動かすためのラッパーです。
 │   ├── Dockerfile        # llama.cpp:full-cuda ベースイメージ + ラッパースクリプト
 │   ├── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・軽量preset生成・llama-server/proxy起動を行う
 │   ├── configure-model-preset.sh # モデル切替時に重い preset 計算を行う
-│   └── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
+│   ├── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
+│   └── unload-model.sh           # コンテナ内からモデルをアンロードするスクリプト
 ├── launch.sh              # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
+├── unload.sh              # 外部(ホスト側)からモデルをアンロードするスクリプト
+├── model_list.txt         # 使用するモデルの指定ファイル (初回起動時に model_list.example から自動作成)
+├── model_list.example     # モデル指定ファイルのサンプル
 ├── continue/
 │   └── config.yaml        # Continue (VS Code拡張) 用のモデル設定サンプル
 └── models/                # モデルダウンロード先 (.gitignore 済み、初回は空でOK)
@@ -39,12 +43,10 @@ Docker コンテナ上で動かすためのラッパーです。
 
 ## 使い方
 
-### 1. モデルを指定して起動
+### 1. 起動
 
-デフォルトでは [docker/start-llama.sh](docker/start-llama.sh) 内の `MODEL_NAMES` に定義された以下の2モデルを使用します。
-
-- `bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf`
-- `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf`
+初回起動時、`model_list.txt` が存在しない場合は `model_list.example` から自動作成され、そこに記述されたモデルが使用されます。
+**自分で使いたいモデルを指定する場合は、`model_list.txt` を編集してください。**
 
 ```bash
 ./launch.sh
@@ -65,13 +67,12 @@ KV キャッシュ量子化や `tensor-split` などの重い計算は起動時�
 curl http://localhost:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen3.8-27B-UD-Q4_K_M",
+    "model": "<モデル名>",
     "messages": [{"role": "user", "content": "hello"}]
   }'
 ```
 
-`model` にはダウンロードした GGUF ファイル名から拡張子を除いたものを指定します
-(例: `Llama-3.2-3B-Instruct-Q4_K_M`, `Qwen3.8-27B-UD-Q4_K_M`)。
+`model` にはダウンロードした GGUF ファイル名から拡張子を除いたものを指定します。
 
 ### ollama-vscode拡張機能から使う場合
 
@@ -81,12 +82,21 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 
 ### 2. モデルリストを変更する
 
-`MODEL_NAMES_CSV` 環境変数で、`リポジトリ名/ファイル名.gguf` をカンマ区切りで指定すると、
-[docker/start-llama.sh](docker/start-llama.sh) 内の `MODEL_NAMES` を上書きできます。
-このリストにないモデルファイルが `models/` にキャッシュされていた場合は起動時に自動削除されます。
+自分が使いたいモデルを指定・変更する場合は、`model_list.txt` を編集します。
+1行につき1つの `Hugging Face リポジトリ名/ファイル名.gguf` を記述します（`#` で始まる行や空行は無視されます）。
+
+```text
+# model_list.txt の例
+<Hugging Face リポジトリ名>/<ファイル名>.gguf
+```
+
+編集後、`./launch.sh` を再実行すると設定が反映されます。
+なお、リストに含まれていないキャッシュ済みモデル（`models/` 配下の `.gguf` ファイル）は、起動時に自動削除されます。
+
+一時的に環境変数でモデルを指定したい場合は、`MODEL_NAMES_CSV` を直接指定して起動することも可能です。
 
 ```bash
-MODEL_NAMES_CSV="bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf" ./launch.sh
+MODEL_NAMES_CSV="<リポジトリ名>/<ファイル名>.gguf" ./launch.sh
 ```
 
 ### 3. モデル保存先を変更する
@@ -96,6 +106,28 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 ```
 
 未指定の場合は `./models` が使われます。
+
+### 4. 外部からモデルをアンロードする
+
+アクティブなモデルを VRAM から手動でアンロードしたい場合は、`./unload.sh` スクリプトを実行します。
+
+```bash
+# 現在ロードされているアクティブモデルをアンロード
+./unload.sh
+
+# 指定したモデルをアンロード
+./unload.sh <モデル名>
+```
+
+また、HTTP API から直接アンロードエンドポイントを呼び出すことも可能です。
+
+```bash
+# 現在アクティブなモデルをアンロード
+curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/json" -d '{}'
+
+# 特定のモデルをアンロード
+curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/json" -d '{"model": "<モデル名>"}'
+```
 
 ## 環境変数一覧
 
@@ -110,9 +142,10 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 | `LLAMA_ROUTER_PORT` | `PORT + 1` | コンテナ内部の llama-server router 用ポート。通常は変更不要 |
 | `PUID` / `PGID` | 実行ユーザーの uid/gid | コンテナ内プロセスの実行ユーザー(ダウンロードファイルの権限をホストと一致させる) |
 | `CUDA_VISIBLE_DEVICES` | (未設定=全GPU) | 使用する GPU を限定したい場合に指定 |
-| `MODEL_NAMES_CSV` | (未設定) | `リポジトリ/ファイル名.gguf` のカンマ区切りリスト。指定するとスクリプト内蔵の `MODEL_NAMES` を上書き |
+| `MODEL_LIST_FILE` | `./model_list.txt` | モデルリストを指定するテキストファイルのパス |
+| `MODEL_NAMES_CSV` | (未設定) | `リポジトリ/ファイル名.gguf` のカンマ区切りリスト。指定すると `model_list.txt` より優先されます |
 | `HF_ENDPOINT` | `https://huggingface.co` | モデルダウンロード元エンドポイント |
-| `MODEL_IDLE_SECONDS` | `300` | この秒数アイドルが続いたモデルは VRAM から解放される |
+| `MODEL_IDLE_SECONDS` | `1800` | この秒数(デフォルト30分)アイドルが続いたモデルは VRAM から解放される |
 | `CONTEXT_SIZE` | (未設定=自動検出) | 全モデル共通のコンテキスト長を固定したい場合に指定。未指定時はモデルの GGUF メタデータ(`<arch>.context_length`)から推奨値を自動検出 |
 | `MAX_CONTEXT_SIZE` | (未設定=上限なし) | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用) |
 | `MIN_CONTEXT_SIZE` | `2048` | KV キャッシュが VRAM に収まらず自動でコンテキスト長を切り詰める際の下限。これを下回る場合のみ `--fit` にフォールバックする |
@@ -126,7 +159,7 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 | `MOE_CPU_OFFLOAD` | `auto` | MoE expert重みのCPU配置。`auto`はアクティブexpert比率が閾値以下の場合、KV確保後に収まらないexpert層だけCPUへ配置。`all`はすべてのMoEモデルで同じ調整を有効化、`off`は無効化 |
 | `MOE_ACTIVE_RATIO_THRESHOLD` | `0.125` | `MOE_CPU_OFFLOAD=auto`でCPU配置を有効にする`expert_used_count / expert_count`の上限 |
 | `MOE_RAM_RESERVE_MIB` | `8192` | MoE expert重みをCPUへ配置した後も残すホストRAMの余白(MiB) |
-| `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
+| `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。KとVは常に同じ型(`cache-type-k` == `cache-type-v`)になるように保証されます。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
 | `TENSOR_SPLIT_MODE` | `auto` | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる |
 
 ## VRAM 管理の仕組み
