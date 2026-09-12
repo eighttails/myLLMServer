@@ -75,7 +75,7 @@ PRESET_FILE="$MODEL_DIR/.models-preset.ini"
 PRESET_SECTION_DIR="$MODEL_DIR/.models-preset.d"
 MODEL_ALIAS_FILE="$MODEL_DIR/.model-aliases.tsv"
 
-/usr/local/bin/sync-models.sh
+/usr/local/bin/sync-model.sh
 
 log "Starting OpenAI-compatible llama-server router on internal port $LLAMA_ROUTER_PORT"
 log "Available models: ${!allowed_files[*]} (models-max=$MODELS_MAX)"

@@ -22,18 +22,18 @@ fi
 mkdir -p "$MODEL_DIR"
 cp "$MODEL_LIST_FILE" "$MODEL_DIR/model_list.txt"
 
-# コンテナが起動中であれば、コンテナ内で sync-models.sh を実行する
+# コンテナが起動中であれば、コンテナ内で sync-model.sh を実行する
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1 && \
    [[ "$(docker container inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == "true" ]]; then
   echo "Reloading model_list and syncing models in container '$CONTAINER_NAME'..."
-  if ! docker exec "$CONTAINER_NAME" test -f /usr/local/bin/sync-models.sh 2>/dev/null; then
-    echo "Installing sync-models.sh into running container..."
-    docker cp "$SCRIPT_DIR/docker/sync-models.sh" "$CONTAINER_NAME:/usr/local/bin/sync-models.sh"
-    docker exec "$CONTAINER_NAME" chmod 0755 /usr/local/bin/sync-models.sh
+  if ! docker exec "$CONTAINER_NAME" test -f /usr/local/bin/sync-model.sh 2>/dev/null; then
+    echo "Installing sync-model.sh into running container..."
+    docker cp "$SCRIPT_DIR/docker/sync-model.sh" "$CONTAINER_NAME:/usr/local/bin/sync-model.sh"
+    docker exec "$CONTAINER_NAME" chmod 0755 /usr/local/bin/sync-model.sh
   fi
-  docker exec "$CONTAINER_NAME" /usr/local/bin/sync-models.sh
+  docker exec "$CONTAINER_NAME" /usr/local/bin/sync-model.sh
 else
   echo "Container '$CONTAINER_NAME' is not running."
   echo "Synced model list to $MODEL_DIR/model_list.txt."
-  echo "Run ./launch.sh to start the container with the updated model list."
+  echo "Run ./launch-container.sh to start the container with the updated model list."
 fi

@@ -24,12 +24,13 @@ Docker コンテナ上で動かすためのラッパーです。
 ├── docker/
 │   ├── Dockerfile        # llama.cpp:full-cuda ベースイメージ + ラッパースクリプト
 │   ├── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・軽量preset生成・llama-server/proxy起動を行う
+│   ├── sync-model.sh     # model_list.txt の読み込み、モデル自動ダウンロード・不要モデル削除を行う
 │   ├── configure-model-preset.sh # モデル切替時に重い preset 計算を行う
 │   ├── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
 │   └── unload-model.sh           # コンテナ内からモデルをアンロードするスクリプト
-├── launch.sh              # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
-├── unload.sh              # 外部(ホスト側)からモデルをアンロードするスクリプト
-├── reload-models.sh       # model_list.txt を再ロードし、新規モデルの追加ダウンロード＆不要モデルの削除を行うスクリプト
+├── launch-container.sh    # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
+├── unload-model.sh        # 外部(ホスト側)からモデルをアンロードするスクリプト
+├── reload-model.sh        # model_list.txt を再ロードし、新規モデルの追加ダウンロード＆不要モデルの削除を行うスクリプト
 ├── model_list.txt         # 使用するモデルの指定ファイル (初回起動時に model_list.example から自動作成)
 ├── model_list.example     # モデル指定ファイルのサンプル
 ├── continue/
@@ -50,7 +51,7 @@ Docker コンテナ上で動かすためのラッパーです。
 **自分で使いたいモデルを指定する場合は、`model_list.txt` を編集してください。**
 
 ```bash
-./launch.sh
+./launch-container.sh
 ```
 
 初回実行時、指定モデルが `models/` 配下になければ Hugging Face から自動ダウンロードされます。
@@ -91,13 +92,13 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 <Hugging Face リポジトリ名>/<ファイル名>.gguf
 ```
 
-編集後、コンテナを再起動せずに `model_list.txt` を再ロードして変更を即座に反映したい場合は、`./reload-models.sh` を実行します。
+編集後、コンテナを再起動せずに `model_list.txt` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
 
 ```bash
-./reload-models.sh
+./reload-model.sh
 ```
 
-このコマンド（または `./launch.sh`）を実行すると、以下の処理が自動で行われます:
+このコマンド（または `./launch-container.sh`）を実行すると、以下の処理が自動で行われます:
 - `model_list.txt` に新たに追加されたモデルを Hugging Face から自動ダウンロード
 - インストール済みだが `model_list.txt` に記載のない（今後使わない）モデルをディスク（`models/`）から自動削除
 - サーバー（llama-server および プロキシ）のモデルリストを即座に更新
@@ -111,27 +112,27 @@ curl -X POST http://localhost:11434/models/reload
 一時的に環境変数でモデルを指定したい場合は、`MODEL_NAMES_CSV` を直接指定して起動することも可能です。
 
 ```bash
-MODEL_NAMES_CSV="<リポジトリ名>/<ファイル名>.gguf" ./launch.sh
+MODEL_NAMES_CSV="<リポジトリ名>/<ファイル名>.gguf" ./launch-container.sh
 ```
 
 ### 3. モデル保存先を変更する
 
 ```bash
-MODEL_DIR=/path/to/your/models ./launch.sh
+MODEL_DIR=/path/to/your/models ./launch-container.sh
 ```
 
 未指定の場合は `./models` が使われます。
 
 ### 4. 外部からモデルをアンロードする
 
-アクティブなモデルを VRAM から手動でアンロードしたい場合は、`./unload.sh` スクリプトを実行します。
+アクティブなモデルを VRAM から手動でアンロードしたい場合は、`./unload-model.sh` スクリプトを実行します。
 
 ```bash
 # 現在ロードされているアクティブモデルをアンロード
-./unload.sh
+./unload-model.sh
 
 # 指定したモデルをアンロード
-./unload.sh <モデル名>
+./unload-model.sh <モデル名>
 ```
 
 また、HTTP API から直接アンロードエンドポイントを呼び出すことも可能です。
@@ -146,7 +147,7 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 
 ## 環境変数一覧
 
-`launch.sh` 実行前に環境変数を export しておくと、コンテナに引き継がれます。
+`launch-container.sh` 実行前に環境変数を export しておくと、コンテナに引き継がれます。
 
 | 変数名 | デフォルト | 説明 |
 |---|---|---|
@@ -264,10 +265,10 @@ nvidia-smi                       # GPU の空き VRAM を確認
 
 ## 再ビルド・再起動
 
-`launch.sh` はイメージの再ビルドと既存コンテナの削除・再作成を毎回行います。
+`launch-container.sh` はイメージの再ビルドと既存コンテナの削除・再作成を毎回行います。
 スクリプトを修正した場合や設定を変更した場合は、変更したい環境変数を export した上で再実行してください。
 
 ```bash
 export KV_CACHE_TYPE=q4_0
-./launch.sh
+./launch-container.sh
 ```

@@ -629,7 +629,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             self.log_message("reloading model list from model_list.txt / MODEL_NAMES_CSV...")
             try:
                 subprocess.run(
-                    ["/usr/local/bin/sync-models.sh"],
+                    ["/usr/local/bin/sync-model.sh"],
                     check=True,
                     env=os.environ.copy(),
                 )
