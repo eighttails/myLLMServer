@@ -11,7 +11,10 @@ N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
 TENSOR_SPLIT_MODE="${TENSOR_SPLIT_MODE:-auto}"
-VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-1536}"
+VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-4096}"
+MOE_CPU_OFFLOAD="${MOE_CPU_OFFLOAD:-auto}"
+MOE_ACTIVE_RATIO_THRESHOLD="${MOE_ACTIVE_RATIO_THRESHOLD:-0.125}"
+MOE_RAM_RESERVE_MIB="${MOE_RAM_RESERVE_MIB:-8192}"
 PRESET_FILE="${PRESET_FILE:-$MODEL_DIR/.models-preset.ini}"
 PRESET_SECTION_DIR="${PRESET_SECTION_DIR:-$MODEL_DIR/.models-preset.d}"
 MODEL_ALIAS_FILE="${MODEL_ALIAS_FILE:-$MODEL_DIR/.model-aliases.tsv}"
@@ -78,10 +81,14 @@ detect_kv_cache_params() {
       if type == "array" then (map(select(type == "number")) | max) else . end;
     (.metadata | to_entries) as $entries
     | ($entries[] | select(.key | endswith(".block_count")) | .value.value | scalar_or_max) as $block_count
-    | ($entries[] | select(.key | endswith(".attention.head_count_kv")) | .value.value | scalar_or_max) as $head_count_kv
+    | ($entries[] | select(.key | endswith(".attention.head_count_kv")) | .value.value) as $head_count_kv
     | ($entries[] | select(.key | endswith(".attention.key_length")) | .value.value | scalar_or_max) as $key_length
     | ($entries[] | select(.key | endswith(".attention.value_length")) | .value.value | scalar_or_max) as $value_length
-    | "\($block_count) \($head_count_kv) \($key_length) \($value_length)"
+    | (if ($head_count_kv | type) == "array"
+       then ($head_count_kv | map(select(type == "number" and . > 0)) | add // 0)
+       else ($block_count * $head_count_kv)
+       end) as $total_kv_heads
+    | "1 \($total_kv_heads) \($key_length) \($value_length)"
   ' 2>/dev/null | head -n1
 }
 
@@ -99,7 +106,7 @@ kv_cache_type_bytes_per_element() {
 # "<kv-cache-type> <ctx-size>" を返す。モデル本体すら VRAM に収まらない場合は
 # 空文字を返し、呼び出し側で llama-server の --fit に委ねる。
 select_kv_cache_type() {
-  local model_file="$1" ctx_size="$2" free_bytes="$3"
+  local model_file="$1" ctx_size="$2" free_bytes="$3" model_bytes_override="${4:-}"
   local params block_count head_count_kv key_length value_length
   params="$(detect_kv_cache_params "$model_file")"
   if [[ -z "$params" ]]; then
@@ -110,7 +117,7 @@ select_kv_cache_type() {
   read -r block_count head_count_kv key_length value_length <<< "$params"
 
   local model_bytes budget_bytes
-  model_bytes="$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)"
+  model_bytes="${model_bytes_override:-$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)}"
   budget_bytes="$(awk -v f="$free_bytes" -v m="$model_bytes" 'BEGIN { b = (f - m) * 0.9; if (b < 0) b = 0; printf "%.0f", b }')"
   if ((budget_bytes <= 0)); then
     log "$(basename "$model_file"): model weights alone exceed free VRAM; falling back to --fit"
@@ -212,14 +219,33 @@ detect_per_gpu_tg_speed() {
 }
 
 detect_layer_bytes() {
+  local model_file="$1" mode="${2:-full}"
+  local args=(layer-bytes)
+  if [[ "$mode" == "exclude" ]]; then
+    args+=(--exclude-moe)
+  elif [[ "$mode" == "split" ]]; then
+    args+=(--split-moe)
+  fi
+  gguf-dump --json --json-array "$model_file" 2>/dev/null | /usr/local/bin/model-preset-utils.py "${args[@]}"
+}
+
+detect_moe_profile() {
   local model_file="$1"
-  gguf-dump --json "$model_file" 2>/dev/null | /usr/local/bin/model-preset-utils.py layer-bytes
+  gguf-dump --json --json-array "$model_file" 2>/dev/null | /usr/local/bin/model-preset-utils.py moe-profile
+}
+
+detect_available_ram_bytes() {
+  awk '/^MemAvailable:/ { printf "%.0f", $2 * 1024; exit }' /proc/meminfo 2>/dev/null
 }
 
 calculate_tensor_split() {
-  local layer_bytes_file="$1" free_mib_list="$2" speed_list="$3" reserve_mib="$4"
-  /usr/local/bin/model-preset-utils.py tensor-split \
-    "$layer_bytes_file" "$free_mib_list" "$speed_list" "$reserve_mib"
+  local layer_bytes_file="$1" free_mib_list="$2" speed_list="$3" reserve_mib="$4" moe_auto="${5:-0}" kv_bytes_per_head="${6:-0}"
+  local args=(tensor-split "$layer_bytes_file" "$free_mib_list" "$speed_list" "$reserve_mib")
+  if [[ "$moe_auto" == 1 ]]; then
+    args+=(--moe-auto)
+  fi
+  args+=(--kv-bytes-per-head "$kv_bytes_per_head")
+  /usr/local/bin/model-preset-utils.py "${args[@]}"
 }
 
 estimate_kv_cache_mib() {
@@ -266,12 +292,42 @@ if [[ -n "$MAX_CONTEXT_SIZE" ]] && ((model_ctx_size > MAX_CONTEXT_SIZE)); then
   model_ctx_size="$MAX_CONTEXT_SIZE"
 fi
 
+model_n_cpu_moe=""
+model_moe_auto=0
+model_gpu_bytes="$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)"
+moe_profile="$(detect_moe_profile "$model_file" || true)"
+if [[ -n "$moe_profile" ]]; then
+  read -r block_count expert_count expert_used_count expert_layer_count expert_bytes <<< "$moe_profile"
+  should_offload_moe=0
+  if [[ "$MOE_CPU_OFFLOAD" == "all" ]] && ((expert_bytes > 0)); then
+    should_offload_moe=1
+  elif [[ "$MOE_CPU_OFFLOAD" == "auto" ]] && ((expert_count > 0 && expert_used_count > 0 && expert_bytes > 0)); then
+    should_offload_moe="$(awk -v used="$expert_used_count" -v total="$expert_count" -v threshold="$MOE_ACTIVE_RATIO_THRESHOLD" \
+      'BEGIN { print ((used / total) <= threshold) ? 1 : 0 }')"
+  fi
+
+  if ((should_offload_moe == 1)); then
+    available_ram_bytes="$(detect_available_ram_bytes)"
+    required_ram_bytes=$((expert_bytes + MOE_RAM_RESERVE_MIB * 1024 * 1024))
+    if [[ "$available_ram_bytes" =~ ^[0-9]+$ ]] && ((available_ram_bytes >= required_ram_bytes)); then
+      model_moe_auto=1
+      model_gpu_bytes=$((model_gpu_bytes - expert_bytes))
+      ((model_gpu_bytes < 0)) && model_gpu_bytes=0
+      active_ratio="$(awk -v used="$expert_used_count" -v total="$expert_count" 'BEGIN { printf "%.1f", 100 * used / total }')"
+      log "$filename: MoE uses $expert_used_count/$expert_count experts ($active_ratio%); prioritizing KV cache, then keeping as many expert layers in VRAM as fit"
+      log "$filename: up to $((expert_bytes / 1024 / 1024)) MiB of expert weights can be moved to CPU for the KV cache"
+    else
+      log "$filename: skipping MoE CPU offload because available host RAM is below expert weights plus MOE_RAM_RESERVE_MIB=$MOE_RAM_RESERVE_MIB"
+    fi
+  fi
+fi
+
 model_kv_cache_type="$KV_CACHE_TYPE"
 model_fit_fallback=0
 total_free_vram_bytes="$(detect_total_free_vram_bytes)"
 if [[ -z "$model_kv_cache_type" ]]; then
   if ((total_free_vram_bytes > 0)); then
-    kv_selection="$(select_kv_cache_type "$model_file" "$model_ctx_size" "$total_free_vram_bytes")"
+    kv_selection="$(select_kv_cache_type "$model_file" "$model_ctx_size" "$total_free_vram_bytes" "$model_gpu_bytes")"
     if [[ -n "$kv_selection" ]]; then
       read -r model_kv_cache_type fitted_ctx_size <<< "$kv_selection"
       if [[ "$fitted_ctx_size" =~ ^[0-9]+$ ]] && ((fitted_ctx_size != model_ctx_size)); then
@@ -296,17 +352,22 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
   if [[ -n "$gpu_tg_speeds" ]]; then
     log "Per-GPU generation speed (tok/s): $(tr '\n' ' ' <<< "$gpu_tg_speeds")"
     layer_bytes_file="$(mktemp)"
-    if detect_layer_bytes "$model_file" > "$layer_bytes_file" && [[ -s "$layer_bytes_file" ]]; then
+    layer_bytes_mode="split"
+    if detect_layer_bytes "$model_file" "$layer_bytes_mode" > "$layer_bytes_file" && [[ -s "$layer_bytes_file" ]]; then
       free_mib_list="$(detect_per_gpu_free_vram_mib)"
       params="$(detect_kv_cache_params "$model_file")"
       kv_total_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$model_ctx_size")"
-      reserve_mib="$(awk -v base="$VRAM_RESERVE_MIB" -v kv="$kv_total_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", base + (kv / n) }')"
-      result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$reserve_mib" || true)"
+      read -r _ total_kv_heads kl vl <<< "$params"
+      bpe="$(kv_cache_type_bytes_per_element "$model_kv_cache_type")"
+      kv_bytes_per_head="$(awk -v kl="$kl" -v vl="$vl" -v ctx="$model_ctx_size" -v bpe="$bpe" \
+        'BEGIN { printf "%.0f", (kl + vl) * ctx * bpe }')"
+      reserve_mib="$VRAM_RESERVE_MIB"
+      result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$reserve_mib" "$model_moe_auto" "$kv_bytes_per_head" || true)"
       if [[ -z "$result" ]]; then
         # KV 選択時の概算では収まっても、GPU ごとの重み配置と固定予約を加えると
         # tensor-split が成立しないことがある。重みだけが収まるなら --fit へ逃げず、
         # 手動配置が成立する最大のコンテキスト長を探索する。
-        model_only_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" || true)"
+        model_only_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" "$model_moe_auto" 0 || true)"
         if [[ -n "$model_only_result" ]]; then
           min_step=$(( (MIN_CONTEXT_SIZE + CONTEXT_SIZE_STEP - 1) / CONTEXT_SIZE_STEP ))
           max_step=$(( model_ctx_size / CONTEXT_SIZE_STEP ))
@@ -316,8 +377,9 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
           if ((min_step <= max_step)); then
             min_ctx=$((min_step * CONTEXT_SIZE_STEP))
             min_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$min_ctx")"
-            min_reserve_mib="$(awk -v base="$VRAM_RESERVE_MIB" -v kv="$min_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", base + (kv / n) }')"
-            min_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$min_reserve_mib" || true)"
+            min_kv_bytes_per_head="$(awk -v kl="$kl" -v vl="$vl" -v ctx="$min_ctx" -v bpe="$bpe" \
+              'BEGIN { printf "%.0f", (kl + vl) * ctx * bpe }')"
+            min_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" "$model_moe_auto" "$min_kv_bytes_per_head" || true)"
             if [[ -n "$min_result" ]]; then
               low_step="$min_step"
               high_step="$max_step"
@@ -325,8 +387,9 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
                 mid_step=$(( (low_step + high_step) / 2 ))
                 trial_ctx=$((mid_step * CONTEXT_SIZE_STEP))
                 trial_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$trial_ctx")"
-                trial_reserve_mib="$(awk -v base="$VRAM_RESERVE_MIB" -v kv="$trial_kv_mib" -v n="$gpu_count" 'BEGIN { printf "%.0f", base + (kv / n) }')"
-                trial_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$trial_reserve_mib" || true)"
+                trial_kv_bytes_per_head="$(awk -v kl="$kl" -v vl="$vl" -v ctx="$trial_ctx" -v bpe="$bpe" \
+                  'BEGIN { printf "%.0f", (kl + vl) * ctx * bpe }')"
+                trial_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" "$model_moe_auto" "$trial_kv_bytes_per_head" || true)"
                 if [[ -n "$trial_result" ]]; then
                   best_ctx="$trial_ctx"
                   best_result="$trial_result"
@@ -350,7 +413,13 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
         fi
       fi
       if [[ -n "$result" ]]; then
-        read -r model_n_gpu_layers_fixed model_tensor_split <<< "$result"
+        read -r model_n_gpu_layers_fixed model_tensor_split model_n_cpu_moe cpu_moe_bytes <<< "$result"
+        if ((model_moe_auto == 1)); then
+          model_n_cpu_moe="${model_n_cpu_moe:-0}"
+          cpu_moe_bytes="${cpu_moe_bytes:-0}"
+          gpu_moe_bytes=$((expert_bytes - cpu_moe_bytes))
+          log "$filename: keeping $((gpu_moe_bytes / 1024 / 1024)) MiB of expert weights in VRAM; offloading $((cpu_moe_bytes / 1024 / 1024)) MiB from the first $model_n_cpu_moe layers"
+        fi
         log "Calculated tensor-split for $filename: n-gpu-layers=$model_n_gpu_layers_fixed tensor-split=$model_tensor_split"
       else
         log "Could not fit a manual tensor-split for $filename within free VRAM"
@@ -379,6 +448,9 @@ tmp_section="$(mktemp "$section_file.tmp.XXXXXX")"
     printf 'tensor-split = %s\n' "$model_tensor_split"
   else
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
+  fi
+  if [[ -n "$model_n_cpu_moe" ]] && ((model_n_cpu_moe > 0)); then
+    printf 'n-cpu-moe = %s\n' "$model_n_cpu_moe"
   fi
   if [[ -n "$model_kv_cache_type" ]]; then
     printf 'cache-type-k = %s\n' "$model_kv_cache_type"

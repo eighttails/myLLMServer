@@ -122,7 +122,10 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 | `FLASH_ATTN` | `on` | Flash Attentionの使用設定。`on`/`off`/`auto`を指定可能 |
 | `BATCH_SIZE` | `1024` | prompt処理の論理バッチサイズ。llama.cpp既定値の2048より小さくして一時的なVRAM使用量を抑制 |
 | `UBATCH_SIZE` | `256` | prompt処理の物理バッチサイズ。llama.cpp既定値の512より小さくして計算バッファのVRAM使用量を抑制。`BATCH_SIZE`以下で指定 |
-| `VRAM_RESERVE_MIB` | `1536` | `--fit`と手動`tensor-split`計算でGPUごとに確保するVRAM余白(MiB) |
+| `VRAM_RESERVE_MIB` | `4096` | `--fit`と手動`tensor-split`計算でGPUごとに確保する、compute bufferとCUDAワークスペースを含むランタイム用のVRAM余白(MiB) |
+| `MOE_CPU_OFFLOAD` | `auto` | MoE expert重みのCPU配置。`auto`はアクティブexpert比率が閾値以下の場合、KV確保後に収まらないexpert層だけCPUへ配置。`all`はすべてのMoEモデルで同じ調整を有効化、`off`は無効化 |
+| `MOE_ACTIVE_RATIO_THRESHOLD` | `0.125` | `MOE_CPU_OFFLOAD=auto`でCPU配置を有効にする`expert_used_count / expert_count`の上限 |
+| `MOE_RAM_RESERVE_MIB` | `8192` | MoE expert重みをCPUへ配置した後も残すホストRAMの余白(MiB) |
 | `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
 | `TENSOR_SPLIT_MODE` | `auto` | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる |
 
@@ -133,6 +136,13 @@ MODEL_DIR=/path/to/your/models ./launch.sh
 - **計算バッファと共有KVの省メモリ化**: Flash Attentionを有効にし、`BATCH_SIZE` / `UBATCH_SIZE`を
   llama.cppの既定値より小さくしています。また、`--kv-unified`により並列スロット間で単一のKVバッファを共有します。
   バッチサイズをさらに下げるとVRAMを節約できますが、長いpromptの処理速度は低下します。
+- **低アクティブ率MoEの自動CPU配置**: GGUFの`expert_count`と`expert_used_count`を調べ、既定では
+  1トークンあたりのアクティブexpert比率が12.5%以下なら、まず全expertをCPUへ置ける前提でKVキャッシュを確保します。
+  その後`n-cpu-moe`を0から順に試し、KVキャッシュとVRAM余白を維持したまま成立する最小値を採用します。
+  したがって、残ったVRAMには可能な限り多くのexpert重みが戻され、収まらない先頭側のexpert層だけがCPUへ配置されます。
+  KVキャッシュはGPU間で均等と仮定せず、各GPUへ割り当てられるAttention層のKV head数に応じて計上します。
+  必要なホストRAMを確保できない場合は自動的にCPU配置を見送ります。CPU配置したexpertの計算・転送により、
+  生成速度が低下する可能性があります。
 - **OOM 回避 (`--fit`)**: 基本方針として `tensor-split` や `n-gpu-layers` は固定値指定を避け、llama-server 側の
   自動フィット機能(`--fit`, デフォルト有効)に GPU 間のレイヤー配置やコンテキストサイズの調整を委ねています。
   これは、固定値を指定すると `--fit` が「ユーザー指定済み」と判断して調整を放棄し、VRAM に収まらない場合に
@@ -154,6 +164,7 @@ MODEL_DIR=/path/to/your/models ./launch.sh
   モデルファイルサイズを差し引いた「予算」を計算し、モデルの GGUF メタデータ(`block_count` /
   `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から算出した必要 KV キャッシュ量と
   比較して、予算に収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択します。
+  `head_count_kv`が層ごとの配列であるSSM/Attentionハイブリッドモデルでは、値が0のSSM層をKV計算から除外します。
 - **コンテキスト長の自動切り詰め**: 最も軽い `q4_0` でも KV キャッシュが予算に収まらない場合は、`--fit` に
   切り替えるのではなく `q4_0` のまま予算に収まるところまで `ctx-size` を切り詰めます(`CONTEXT_SIZE_STEP`
   の倍数に丸め、`MIN_CONTEXT_SIZE` を下限とします)。KV キャッシュの概算では収まっていても、GPU ごとの

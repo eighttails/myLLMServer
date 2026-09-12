@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import configparser
 import http.server
 import json
 import os
@@ -43,9 +44,28 @@ class LazyProxy(http.server.ThreadingHTTPServer):
         try:
             with open(alias_file, "r", encoding="utf-8") as handle:
                 for line in handle:
-                    alias, _, filename = line.rstrip("\n").partition("\t")
-                    if alias and filename:
-                        entries.append({"alias": alias, "filename": filename})
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) != 4:
+                        raise RuntimeError(
+                            f"invalid model alias entry in {alias_file}: expected 4 fields"
+                        )
+                    alias, filename, architecture, context_length = fields
+                    try:
+                        context_length = int(context_length)
+                    except ValueError as err:
+                        raise RuntimeError(
+                            f"invalid context length for model {alias}: {context_length}"
+                        ) from err
+                    if not alias or not filename or not architecture or context_length <= 0:
+                        raise RuntimeError(f"invalid model alias entry for model {alias}")
+                    entries.append(
+                        {
+                            "alias": alias,
+                            "filename": filename,
+                            "architecture": architecture,
+                            "context_length": context_length,
+                        }
+                    )
         except OSError as err:
             raise RuntimeError(f"failed to read model alias file {alias_file}: {err}") from err
         return entries
@@ -58,6 +78,27 @@ class LazyProxy(http.server.ThreadingHTTPServer):
             aliases[alias] = alias
             aliases[filename] = alias
         return aliases
+
+    def model_context_length(self, entry):
+        section_dir = os.environ.get("PRESET_SECTION_DIR")
+        if not section_dir:
+            raise RuntimeError("PRESET_SECTION_DIR is not configured")
+
+        parser = configparser.RawConfigParser()
+        section_file = os.path.join(section_dir, f"{entry['alias']}.ini")
+        try:
+            with open(section_file, "r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+            context_length = parser.getint(entry["alias"], "ctx-size")
+        except (OSError, configparser.Error, ValueError) as err:
+            raise RuntimeError(
+                f"failed to read context length for model {entry['alias']}: {err}"
+            ) from err
+        if context_length <= 0:
+            raise RuntimeError(
+                f"invalid context length for model {entry['alias']}: {context_length}"
+            )
+        return context_length
 
 
 class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -102,8 +143,10 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
         except json.JSONDecodeError:
             return None
-        if isinstance(payload, dict) and isinstance(payload.get("model"), str):
-            return payload["model"]
+        if isinstance(payload, dict):
+            for key in ("model", "name"):
+                if isinstance(payload.get(key), str):
+                    return payload[key]
         return None
 
     def _request_backend(self, method, path, body=b"", headers=None):
@@ -277,6 +320,8 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         filename = entry["filename"]
+        architecture = entry["architecture"]
+        context_length = self.server.model_context_length(entry)
         # Copilot 等はモデル一覧表示時に全モデルへ /api/show を投げるため、
         # ここでモデルのロードやプリセット再計算を行ってはならない (タイムアウトの原因になる)。
         self._send_json(
@@ -296,7 +341,9 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 },
                 "model_info": {
                     "general.basename": canonical_model,
+                    "general.architecture": architecture,
                     "general.file_type": 15,
+                    f"{architecture}.context_length": context_length,
                 },
                 "capabilities": ["completion", "tools"],
                 "modified_at": self._ollama_modified_at(filename),

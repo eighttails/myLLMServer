@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# モデルリストは run-llama.sh 経由で MODEL_NAMES_CSV 環境変数として渡される。
+# モデルリストは launch.sh 経由で MODEL_NAMES_CSV 環境変数として渡される。
 # 形式: Hugging Face のリポジトリ名/ファイル名.gguf をカンマ区切りで指定。
 MODEL_NAMES=()
 
@@ -27,7 +27,12 @@ FLASH_ATTN="${FLASH_ATTN:-on}"
 BATCH_SIZE="${BATCH_SIZE:-1024}"
 UBATCH_SIZE="${UBATCH_SIZE:-256}"
 # --fit と手動tensor-split計算の両方で、GPUごとに残すVRAM余白。
-VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-1536}"
+# 大規模なUD量子化モデルでは、計算バッファに加えて生成開始時のCUDA
+# ワークスペースも必要になるため4 GiBを確保する。
+VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-4096}"
+MOE_CPU_OFFLOAD="${MOE_CPU_OFFLOAD:-auto}"
+MOE_ACTIVE_RATIO_THRESHOLD="${MOE_ACTIVE_RATIO_THRESHOLD:-0.125}"
+MOE_RAM_RESERVE_MIB="${MOE_RAM_RESERVE_MIB:-8192}"
 # 複数 GPU の性能差(生成速度)を考慮した tensor-split を自動計算するかどうか。
 # auto: 2 GPU 以上あり、各 GPU の生成速度比が十分な差(閾値以上)であれば手動計算した
 #       tensor-split / n-gpu-layers を明示指定する(--fit は off にする)。
@@ -57,6 +62,9 @@ die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
 [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] && ((BATCH_SIZE > 0)) || die "BATCH_SIZE must be a positive integer"
 [[ "$UBATCH_SIZE" =~ ^[0-9]+$ ]] && ((UBATCH_SIZE > 0 && UBATCH_SIZE <= BATCH_SIZE)) || die "UBATCH_SIZE must be a positive integer no greater than BATCH_SIZE"
 [[ "$VRAM_RESERVE_MIB" =~ ^[0-9]+$ ]] && ((VRAM_RESERVE_MIB > 0)) || die "VRAM_RESERVE_MIB must be a positive integer"
+[[ "$MOE_CPU_OFFLOAD" == "auto" || "$MOE_CPU_OFFLOAD" == "off" || "$MOE_CPU_OFFLOAD" == "all" ]] || die "MOE_CPU_OFFLOAD must be 'auto', 'off', or 'all'"
+awk -v value="$MOE_ACTIVE_RATIO_THRESHOLD" 'BEGIN { exit !(value > 0 && value <= 1) }' || die "MOE_ACTIVE_RATIO_THRESHOLD must be greater than 0 and no greater than 1"
+[[ "$MOE_RAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "MOE_RAM_RESERVE_MIB must be a non-negative integer"
 [[ "$TENSOR_SPLIT_MODE" == "auto" || "$TENSOR_SPLIT_MODE" == "off" ]] || die "TENSOR_SPLIT_MODE must be 'auto' or 'off'"
 case "$KV_CACHE_TYPE" in
   ""|f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;;
@@ -98,15 +106,31 @@ for model_spec in "${MODEL_NAMES[@]}"; do
     log "Using cached model: $filename"
   fi
 
-  printf '%s\t%s\n' "$alias_name" "$filename" >> "$MODEL_ALIAS_FILE"
+  model_metadata="$(
+    gguf-dump --no-tensors --json --json-array "$destination" 2>/dev/null | jq -r '
+      (.metadata | to_entries) as $entries
+      | ($entries[] | select(.key == "general.architecture") | .value.value) as $architecture
+      | ($entries[] | select(.key | endswith(".context_length")) | .value.value) as $context_length
+      | select(($architecture | type) == "string" and ($context_length | type) == "number")
+      | [$architecture, $context_length] | @tsv
+    '
+  )"
+  [[ "$model_metadata" == *$'\t'* ]] || die "could not detect architecture and context length: $filename"
+  model_architecture="${model_metadata%%$'\t'*}"
+  detected_context_size="${model_metadata#*$'\t'}"
+  advertised_context_size="${CONTEXT_SIZE:-$detected_context_size}"
+  if [[ -n "$MAX_CONTEXT_SIZE" ]] && ((advertised_context_size > MAX_CONTEXT_SIZE)); then
+    advertised_context_size="$MAX_CONTEXT_SIZE"
+  fi
+
+  printf '%s\t%s\t%s\t%s\n' \
+    "$alias_name" "$filename" "$model_architecture" "$advertised_context_size" >> "$MODEL_ALIAS_FILE"
   {
     printf '[%s]\n' "$alias_name"
     printf 'model = %s\n' "$destination"
     printf 'sleep-idle-seconds = %s\n' "$MODEL_IDLE_SECONDS"
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
-    if [[ -n "$CONTEXT_SIZE" ]]; then
-      printf 'ctx-size = %s\n' "$CONTEXT_SIZE"
-    fi
+    printf 'ctx-size = %s\n' "$advertised_context_size"
     if [[ -n "$KV_CACHE_TYPE" ]]; then
       printf 'cache-type-k = %s\n' "$KV_CACHE_TYPE"
       printf 'cache-type-v = %s\n' "$KV_CACHE_TYPE"
@@ -177,7 +201,7 @@ for _ in $(seq 1 60); do
 done
 ((router_ready == 1)) || die "llama-server router did not become ready"
 
-export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE
+export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB MOE_CPU_OFFLOAD MOE_ACTIVE_RATIO_THRESHOLD MOE_RAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE
 export PRESET_FILE PRESET_SECTION_DIR MODEL_ALIAS_FILE
 export LLAMA_ROUTER_URL="http://127.0.0.1:$LLAMA_ROUTER_PORT"
 
