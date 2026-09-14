@@ -14,9 +14,93 @@ LLAMA_ROUTER_PORT="${LLAMA_ROUTER_PORT:-11435}"
 PRESET_FILE="${PRESET_FILE:-$MODEL_DIR/.models-preset.ini}"
 PRESET_SECTION_DIR="${PRESET_SECTION_DIR:-$MODEL_DIR/.models-preset.d}"
 MODEL_ALIAS_FILE="${MODEL_ALIAS_FILE:-$MODEL_DIR/.model-aliases.tsv}"
+METADATA_CACHE_FILE="${METADATA_CACHE_FILE:-$MODEL_DIR/.model-metadata-cache.tsv}"
+DOWNLOAD_MAX_STALLED_ATTEMPTS="${DOWNLOAD_MAX_STALLED_ATTEMPTS:-10}"
 
 log() { printf '[llama-wrapper] %s\n' "$*" >&2; }
 die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
+
+# ファイル内容が変わったことを検出するための署名（サイズ:更新時刻）
+file_signature() {
+  stat -c '%s:%Y' -- "$1" 2>/dev/null || printf 'unknown:unknown'
+}
+
+file_size() {
+  stat -c '%s' -- "$1" 2>/dev/null || printf '0'
+}
+
+# GGUF ヘッダーを解析して "アーキテクチャ<TAB>コンテキスト長" を返す
+read_gguf_metadata() {
+  gguf-dump --no-tensors --json --json-array "$1" 2>/dev/null | jq -r '
+    (.metadata | to_entries) as $entries
+    | ($entries[] | select(.key == "general.architecture") | .value.value) as $architecture
+    | ($entries[] | select(.key | endswith(".context_length")) | .value.value) as $context_length
+    | select(($architecture | type) == "string" and ($context_length | type) == "number")
+    | [$architecture, $context_length] | @tsv
+  ' || true
+}
+
+# 再開可能なダウンロード。SSL エラーなど一時的な失敗は続きから何度でも再試行する。
+download_with_resume() {
+  local url="$1" temporary="$2" label="$3"
+  local rc error_output stalled=0 delay=2
+  local size_before size_after
+  local -a curl_args
+
+  while :; do
+    size_before="$(file_size "$temporary")"
+    curl_args=(
+      --fail --location --show-error --silent
+      --retry 5 --retry-delay 2 --retry-connrefused
+      --connect-timeout 30
+      --output "$temporary"
+    )
+    if [[ -s "$temporary" ]]; then
+      curl_args+=(--continue-at -)
+    fi
+
+    set +e
+    error_output="$(curl "${curl_args[@]}" "$url" 2>&1)"
+    rc=$?
+    set -e
+
+    if ((rc == 0)); then
+      return 0
+    fi
+
+    case "$rc" in
+      33|416)
+        # サーバーが範囲リクエストを拒否した場合のみ最初からやり直す
+        log "Resume not supported by server; restarting download: $label"
+        rm -f -- "$temporary"
+        stalled=0
+        delay=2
+        continue
+        ;;
+      6|7|16|18|28|35|52|55|56|92)
+        : # 一時的なネットワーク/SSL エラーとして再開リトライする
+        ;;
+      *)
+        die "failed to download $label (curl exit $rc): ${error_output:-unknown error}"
+        ;;
+    esac
+
+    size_after="$(file_size "$temporary")"
+    if ((size_after > size_before)); then
+      stalled=0
+      delay=2
+    else
+      stalled=$((stalled + 1))
+      if ((stalled >= DOWNLOAD_MAX_STALLED_ATTEMPTS)); then
+        die "download made no progress after ${stalled} attempts: $label (curl exit $rc): ${error_output:-unknown error}"
+      fi
+      ((delay < 30)) && delay=$((delay * 2))
+    fi
+
+    log "Download interrupted (curl exit $rc); resuming from $(file_size "$temporary") bytes in ${delay}s: $label"
+    sleep "$delay"
+  done
+}
 
 # /models/model_list.txt が存在すればそこから最新のモデルリストを読み込む
 if [[ -f "$MODEL_DIR/model_list.txt" ]]; then
@@ -36,9 +120,21 @@ fi
 mkdir -p "$MODEL_DIR"
 PRESET_TMP_DIR="${PRESET_SECTION_DIR}.tmp"
 ALIAS_TMP_FILE="${MODEL_ALIAS_FILE}.tmp"
+METADATA_CACHE_TMP_FILE="${METADATA_CACHE_FILE}.tmp"
 rm -rf "$PRESET_TMP_DIR"
 mkdir -p "$PRESET_TMP_DIR"
 : > "$ALIAS_TMP_FILE"
+: > "$METADATA_CACHE_TMP_FILE"
+
+# 前回の GGUF 検証結果を読み込む（ファイルが変化していなければ再解析しない）
+declare -A metadata_cache=()
+if [[ -f "$METADATA_CACHE_FILE" ]]; then
+  while IFS=$'\t' read -r cached_name cached_signature cached_architecture cached_context || [[ -n "${cached_name:-}" ]]; do
+    [[ -n "${cached_name:-}" && -n "${cached_signature:-}" ]] || continue
+    [[ -n "${cached_architecture:-}" && -n "${cached_context:-}" ]] || continue
+    metadata_cache["$cached_name:$cached_signature"]="$cached_architecture"$'\t'"$cached_context"
+  done < "$METADATA_CACHE_FILE"
+fi
 
 declare -A allowed_files=()
 
@@ -51,27 +147,39 @@ for model_spec in "${MODEL_NAMES[@]}"; do
   alias_name="${filename%.gguf}"
   allowed_files["$filename"]=1
 
+  model_metadata=""
+  if [[ -f "$destination" ]]; then
+    cache_key="$filename:$(file_signature "$destination")"
+    if [[ -n "${metadata_cache[$cache_key]+x}" ]]; then
+      model_metadata="${metadata_cache[$cache_key]}"
+      log "Using cached model: $filename"
+    else
+      model_metadata="$(read_gguf_metadata "$destination")"
+      if [[ "$model_metadata" == *$'\t'* ]]; then
+        log "Verified model: $filename"
+      else
+        log "Cached model is invalid; downloading again: $filename"
+        model_metadata=""
+        rm -f -- "$destination"
+      fi
+    fi
+  fi
+
   if [[ ! -f "$destination" ]]; then
     log "Downloading $model_spec"
     temporary="$destination.part"
-    rm -f "$temporary"
-    curl --fail --location --retry 3 --retry-delay 2 \
-      --output "$temporary" \
-      "$HF_ENDPOINT/$repo/resolve/main/$filename?download=true"
+    # 途中まで取得済みのファイルは削除せず、続きから再開する
+    download_with_resume \
+      "$HF_ENDPOINT/$repo/resolve/main/$filename?download=true" \
+      "$temporary" \
+      "$model_spec"
     mv "$temporary" "$destination"
-  else
-    log "Using cached model: $filename"
   fi
 
-  model_metadata="$(
-    gguf-dump --no-tensors --json --json-array "$destination" 2>/dev/null | jq -r '
-      (.metadata | to_entries) as $entries
-      | ($entries[] | select(.key == "general.architecture") | .value.value) as $architecture
-      | ($entries[] | select(.key | endswith(".context_length")) | .value.value) as $context_length
-      | select(($architecture | type) == "string" and ($context_length | type) == "number")
-      | [$architecture, $context_length] | @tsv
-    '
-  )"
+  if [[ -z "$model_metadata" ]]; then
+    model_metadata="$(read_gguf_metadata "$destination")"
+    [[ "$model_metadata" == *$'\t'* ]] || die "could not read GGUF metadata after download: $filename"
+  fi
   [[ "$model_metadata" == *$'\t'* ]] || die "could not detect architecture and context length: $filename"
   model_architecture="${model_metadata%%$'\t'*}"
   detected_context_size="${model_metadata#*$'\t'}"
@@ -80,6 +188,9 @@ for model_spec in "${MODEL_NAMES[@]}"; do
     advertised_context_size="$MAX_CONTEXT_SIZE"
   fi
 
+  printf '%s\t%s\t%s\t%s\n' \
+    "$filename" "$(file_signature "$destination")" "$model_architecture" "$detected_context_size" \
+    >> "$METADATA_CACHE_TMP_FILE"
   printf '%s\t%s\t%s\t%s\n' \
     "$alias_name" "$filename" "$model_architecture" "$advertised_context_size" >> "$ALIAS_TMP_FILE"
   {
@@ -111,6 +222,7 @@ shopt -u nullglob
 rm -rf "$PRESET_SECTION_DIR"
 mv "$PRESET_TMP_DIR" "$PRESET_SECTION_DIR"
 mv "$ALIAS_TMP_FILE" "$MODEL_ALIAS_FILE"
+mv "$METADATA_CACHE_TMP_FILE" "$METADATA_CACHE_FILE"
 
 {
   printf '[*]\n'

@@ -77,8 +77,9 @@ MODEL_ALIAS_FILE="$MODEL_DIR/.model-aliases.tsv"
 
 /usr/local/bin/sync-model.sh
 
+available_models="$(cut -f1 "$MODEL_ALIAS_FILE" | paste -sd' ' -)"
 log "Starting OpenAI-compatible llama-server router on internal port $LLAMA_ROUTER_PORT"
-log "Available models: ${!allowed_files[*]} (models-max=$MODELS_MAX)"
+log "Available models: $available_models (models-max=$MODELS_MAX)"
 llama-server \
   --models-preset "$PRESET_FILE" \
   --models-max "$MODELS_MAX" \
