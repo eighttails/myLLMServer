@@ -198,23 +198,62 @@ fi
 ((gpu_count > 0)) || gpu_count=1
 
 BENCH_TG_CACHE="$MODEL_DIR/.gpu-tg-speed.tsv"
+# 重みが1つのGPUのVRAMに収まらない大規模モデルは、-ngl 99 で単一GPUだけ
+# を見えるようにしてベンチマークするとモデルがロードできず常に 0 tok/s を
+# 返してしまう。Tensor Split は各GPU間の「相対速度」が大事なので、単一GPUに
+# 確実に収まる小さなモデルで相対速度を測定し、キャッシュを再利用する。
+BENCH_BENCH_MODEL=""
+find_benchmark_model() {
+  [[ -n "$BENCH_BENCH_MODEL" ]] && return 0
+  for candidate in \
+    "$MODEL_DIR/Llama-3.2-3B-Instruct-Q4_K_M.gguf" \
+    "$MODEL_DIR/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf" \
+    "$MODEL_DIR/gpt-oss-20b-Q4_K_M.gguf" \
+    "$MODEL_DIR/Ornith-1.5-35B-Q4_K_M.gguf" ; do
+    [[ -f "$candidate" ]] || continue
+    speed="$(CUDA_VISIBLE_DEVICES=0 /app/llama-bench -m "$candidate" -ngl 99 -p 0 -n 32 \
+        --output json 2>/dev/null | /usr/local/bin/model-preset-utils.py benchmark-speed 2>/dev/null)"
+    if [[ "$speed" =~ ^[0-9.]+$ ]] && awk -v s="$speed" 'BEGIN { exit !(s > 0) }'; then
+      BENCH_BENCH_MODEL="$candidate"
+      log "Using $BENCH_BENCH_MODEL as benchmark model for per-GPU speed (fits on a single GPU, $speed tok/s)"
+      return 0
+    fi
+  done
+  BENCH_BENCH_MODEL=""
+  log "No single-GPU-fitting model found for speed benchmark; will fall back to --fit"
+  return 1
+}
 detect_per_gpu_tg_speed() {
   local benchmark_model="$1"
   if ((gpu_count < 2)); then
     echo ""
     return
   fi
-  if [[ ! -f "$BENCH_TG_CACHE" ]]; then
-    log "Benchmarking per-GPU generation speed for tensor-split calculation (one-time, on first model switch)"
-    : > "$BENCH_TG_CACHE"
-    local i speed
-    for ((i = 0; i < gpu_count; i++)); do
-      speed="$(CUDA_VISIBLE_DEVICES="$i" llama-bench -m "$benchmark_model" -ngl 99 -p 0 -n 32 \
-        --output json 2>/dev/null | /usr/local/bin/model-preset-utils.py benchmark-speed 2>/dev/null)"
-      [[ "$speed" =~ ^[0-9.]+$ ]] || speed=0
-      printf '%s\n' "$speed" >> "$BENCH_TG_CACHE"
-    done
+  # 前回の走測が単一GPUに収まらないモデルによる失敗(0)でキャッシュが汚染
+  # されている場合があるので、有効な速度が出ていれば再測定の必要はない。
+  if [[ -f "$BENCH_TG_CACHE" ]] && grep -Eq '^[0-9.]+' "$BENCH_TG_CACHE" \
+      && [[ "$(grep -cE '^[0-9.]+' "$BENCH_TG_CACHE")" -ge "$gpu_count" ]]; then
+    local ok_speed
+    ok_speed="$(grep -E '^[0-9.]+' "$BENCH_TG_CACHE" | head -n 1)"
+    if [[ -n "$ok_speed" && "$ok_speed" != "0" && "$ok_speed" != "0.0" ]]; then
+      cat "$BENCH_TG_CACHE"
+      return
+    fi
+    log "Previous per-GPU speed cache is invalid; re-benchmarking"
+    rm -f "$BENCH_TG_CACHE"
   fi
+  if ! find_benchmark_model; then
+    return 1
+  fi
+  log "Benchmarking per-GPU generation speed for tensor-split calculation (one-time, on first model switch)"
+  : > "$BENCH_TG_CACHE"
+  local i speed
+  for ((i = 0; i < gpu_count; i++)); do
+    speed="$(CUDA_VISIBLE_DEVICES="$i" /app/llama-bench -m "$BENCH_BENCH_MODEL" -ngl 99 -p 0 -n 32 \
+      --output json 2>/dev/null | /usr/local/bin/model-preset-utils.py benchmark-speed 2>/dev/null)"
+    [[ "$speed" =~ ^[0-9.]+$ ]] || speed=0
+    printf '%s\n' "$speed" >> "$BENCH_TG_CACHE"
+  done
   cat "$BENCH_TG_CACHE"
 }
 
