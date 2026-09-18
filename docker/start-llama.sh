@@ -39,6 +39,17 @@ MOE_RAM_RESERVE_MIB="${MOE_RAM_RESERVE_MIB:-8192}"
 #       計算に失敗した場合や条件を満たさない場合は自動的に --fit on にフォールバックする。
 # off:  常に --fit on に委ねる(従来の挙動)。
 TENSOR_SPLIT_MODE="${TENSOR_SPLIT_MODE:-auto}"
+# llama-server の --split-mode。複数GPU間でモデルをどう分割するか。
+# layer (既定): レイヤー単位でGPUに分割(パイプライン並列)。1トークン生成中は
+#               常にどれか1枚のGPUのみが計算するため、GPU使用率は50%前後に留まりやすい。
+# row:          各レイヤーの重みを行単位でGPU間に分割(テンソル並列)。全GPUが同時に計算に
+#               参加できるため使用率は上がりうるが、GPU間の同期が毎レイヤー発生するため、
+#               NVLink等の高速な相互接続が無い環境では逆に遅くなることがある。
+# tensor:       重みとKVキャッシュの両方をGPU間に分割(実験的、rowと同様に並列化される)。
+# none:         単一GPUのみ使用。
+# TENSOR_SPLIT_MODE=auto によるレイヤー数の自動配分計算は layer 分割前提のロジックのため、
+# SPLIT_MODE が layer 以外の場合は自動計算をスキップし --fit に委ねる。
+SPLIT_MODE="${SPLIT_MODE:-layer}"
 # KV キャッシュの量子化タイプ (f16 既定より VRAM を大幅削減できる: q8_0 で約1/2, q4_0 で約1/4)
 # allowed: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
 # 未指定の場合は、空き VRAM とモデルサイズ・コンテキスト長から必要な KV キャッシュ量を見積もり、
@@ -66,6 +77,7 @@ die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
 awk -v value="$MOE_ACTIVE_RATIO_THRESHOLD" 'BEGIN { exit !(value > 0 && value <= 1) }' || die "MOE_ACTIVE_RATIO_THRESHOLD must be greater than 0 and no greater than 1"
 [[ "$MOE_RAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "MOE_RAM_RESERVE_MIB must be a non-negative integer"
 [[ "$TENSOR_SPLIT_MODE" == "auto" || "$TENSOR_SPLIT_MODE" == "off" ]] || die "TENSOR_SPLIT_MODE must be 'auto' or 'off'"
+[[ "$SPLIT_MODE" == "none" || "$SPLIT_MODE" == "layer" || "$SPLIT_MODE" == "row" || "$SPLIT_MODE" == "tensor" ]] || die "SPLIT_MODE must be 'none', 'layer', 'row', or 'tensor'"
 case "$KV_CACHE_TYPE" in
   ""|f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;;
   *) die "KV_CACHE_TYPE must be one of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1" ;;
@@ -120,7 +132,7 @@ for _ in $(seq 1 60); do
 done
 ((router_ready == 1)) || die "llama-server router did not become ready"
 
-export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB MOE_CPU_OFFLOAD MOE_ACTIVE_RATIO_THRESHOLD MOE_RAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE
+export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB MOE_CPU_OFFLOAD MOE_ACTIVE_RATIO_THRESHOLD MOE_RAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE SPLIT_MODE
 export PRESET_FILE PRESET_SECTION_DIR MODEL_ALIAS_FILE
 export LLAMA_ROUTER_URL="http://127.0.0.1:$LLAMA_ROUTER_PORT"
 

@@ -9,6 +9,7 @@ CONTEXT_SIZE="${CONTEXT_SIZE:-}"
 MAX_CONTEXT_SIZE="${MAX_CONTEXT_SIZE:-}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
+SPLIT_MODE="${SPLIT_MODE:-layer}"
 LLAMA_ROUTER_PORT="${LLAMA_ROUTER_PORT:-11435}"
 
 PRESET_FILE="${PRESET_FILE:-$MODEL_DIR/.models-preset.ini}"
@@ -290,6 +291,7 @@ mv "$METADATA_CACHE_TMP_FILE" "$METADATA_CACHE_FILE"
 {
   printf '[*]\n'
   printf 'fit = on\n'
+  printf 'split-mode = %s\n' "$SPLIT_MODE"
   printf '\n'
   for section_file in "$PRESET_SECTION_DIR"/*.ini; do
     [[ -f "$section_file" ]] || continue

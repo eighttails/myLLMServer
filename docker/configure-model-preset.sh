@@ -11,6 +11,7 @@ N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
 TENSOR_SPLIT_MODE="${TENSOR_SPLIT_MODE:-auto}"
+SPLIT_MODE="${SPLIT_MODE:-layer}"
 VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-4096}"
 MOE_CPU_OFFLOAD="${MOE_CPU_OFFLOAD:-auto}"
 MOE_ACTIVE_RATIO_THRESHOLD="${MOE_ACTIVE_RATIO_THRESHOLD:-0.125}"
@@ -306,7 +307,8 @@ render_preset() {
   tmp="$(mktemp "$PRESET_FILE.tmp.XXXXXX")"
   {
     printf '[*]\n'
-    printf 'fit = on\n\n'
+    printf 'fit = on\n'
+    printf 'split-mode = %s\n\n' "$SPLIT_MODE"
     for section_file in "$PRESET_SECTION_DIR"/*.ini; do
       [[ -f "$section_file" ]] || continue
       cat "$section_file"
@@ -386,6 +388,10 @@ model_tensor_split=""
 model_n_gpu_layers_fixed=""
 if [[ "$model_fit_fallback" == 1 ]]; then
   log "Model weights do not fit in free VRAM for $filename; relying on llama-server's --fit auto-adjustment"
+elif [[ "$SPLIT_MODE" != "layer" ]]; then
+  # 手動 tensor-split/n-gpu-layers 計算は「レイヤーを丸ごと1枚のGPUに割り当てる」前提の
+  # ロジックのため、row/tensor/none 分割では成立しない。--fit に委ねる。
+  log "SPLIT_MODE=$SPLIT_MODE; skipping layer-based tensor-split calculation and relying on llama-server's --fit auto-adjustment"
 elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
   gpu_tg_speeds="$(detect_per_gpu_tg_speed "$model_file")"
   if [[ -n "$gpu_tg_speeds" ]]; then
