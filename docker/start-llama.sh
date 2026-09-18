@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # モデルリストは launch.sh 経由で MODEL_NAMES_CSV 環境変数として渡される。
-# 形式: Hugging Face のリポジトリ名/ファイル名.gguf をカンマ区切りで指定。
+# 形式: Hugging Faceのダウンロードリンクをカンマ区切りで指定。
 MODEL_NAMES=()
 
 MODEL_DIR="${MODEL_DIR:-/models}"

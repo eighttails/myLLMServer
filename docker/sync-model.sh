@@ -81,7 +81,8 @@ download_with_resume() {
         : # 一時的なネットワーク/SSL エラーとして再開リトライする
         ;;
       *)
-        die "failed to download $label (curl exit $rc): ${error_output:-unknown error}"
+        log "error: failed to download $label (curl exit $rc): ${error_output:-unknown error}"
+        return 1
         ;;
     esac
 
@@ -92,7 +93,8 @@ download_with_resume() {
     else
       stalled=$((stalled + 1))
       if ((stalled >= DOWNLOAD_MAX_STALLED_ATTEMPTS)); then
-        die "download made no progress after ${stalled} attempts: $label (curl exit $rc): ${error_output:-unknown error}"
+        log "error: download made no progress after ${stalled} attempts: $label (curl exit $rc): ${error_output:-unknown error}"
+        return 1
       fi
       ((delay < 30)) && delay=$((delay * 2))
     fi
@@ -137,15 +139,51 @@ if [[ -f "$METADATA_CACHE_FILE" ]]; then
 fi
 
 declare -A allowed_files=()
+model_success_count=0
+skipped_models=()
 
-for model_spec in "${MODEL_NAMES[@]}"; do
-  [[ "$model_spec" == */* ]] || die "invalid model spec: $model_spec"
-  repo="${model_spec%/*}"
-  filename="${model_spec##*/}"
-  [[ "$filename" == *.gguf ]] || die "model must be a .gguf file: $model_spec"
+# モデル1件分の準備処理（不正なURL・ダウンロード失敗・GGUF読み取り失敗などは
+# 致命的エラーとせず、そのモデルだけスキップして 1 を返す）
+process_model_spec() {
+  local model_spec="$1"
+  local download_url="" filename repo destination alias_name
+  local model_metadata cache_key temporary
+  local model_architecture detected_context_size advertised_context_size
+
+  # フルURL形式 (https://huggingface.co/.../resolve/main/....gguf) と
+  # 従来の短縮形式 (owner/repo/filename.gguf) の両方に対応する
+  if [[ "$model_spec" == https://huggingface.co/* ]]; then
+    filename=$(basename "${model_spec%%\?*}")
+    # クエリパラメータ（例: ?download=true）が付いていなければ付与する
+    if [[ "$model_spec" == *\?* ]]; then
+      download_url="$model_spec"
+    else
+      download_url="${model_spec}?download=true"
+    fi
+    # HF_ENDPOINT が変更されている場合（ミラー等）はホスト部分を差し替える
+    if [[ "$HF_ENDPOINT" != "https://huggingface.co" ]]; then
+      download_url="${HF_ENDPOINT}${download_url#https://huggingface.co}"
+    fi
+    # ログ表示用に owner/repo 部分を抽出
+    model_spec="${model_spec#https://huggingface.co/}"
+    model_spec="${model_spec%%/resolve/*}"
+  else
+    # 従来形式: owner/repo/filename.gguf
+    filename="$(basename "$model_spec")"
+    repo="${model_spec%/*}"
+    download_url="$HF_ENDPOINT/$repo/resolve/main/$filename?download=true"
+  fi
+
+  if [[ "$model_spec" != */* ]]; then
+    log "error: invalid model spec: $model_spec (owner/repo が抜けています。Hugging Faceの「Copy download link」で取得したURL https://huggingface.co/{owner}/{repo}/resolve/main/{filename} を確認してください) -- skipping this model"
+    return 1
+  fi
+  if [[ "$filename" != *.gguf ]]; then
+    log "error: model must be a .gguf file: $filename -- skipping this model"
+    return 1
+  fi
   destination="$MODEL_DIR/$filename"
   alias_name="${filename%.gguf}"
-  allowed_files["$filename"]=1
 
   model_metadata=""
   if [[ -f "$destination" ]]; then
@@ -169,18 +207,21 @@ for model_spec in "${MODEL_NAMES[@]}"; do
     log "Downloading $model_spec"
     temporary="$destination.part"
     # 途中まで取得済みのファイルは削除せず、続きから再開する
-    download_with_resume \
-      "$HF_ENDPOINT/$repo/resolve/main/$filename?download=true" \
-      "$temporary" \
-      "$model_spec"
+    if ! download_with_resume "$download_url" "$temporary" "$model_spec"; then
+      log "error: skipping model due to download failure: $model_spec"
+      return 1
+    fi
     mv "$temporary" "$destination"
   fi
 
   if [[ -z "$model_metadata" ]]; then
     model_metadata="$(read_gguf_metadata "$destination")"
-    [[ "$model_metadata" == *$'\t'* ]] || die "could not read GGUF metadata after download: $filename"
+    if [[ "$model_metadata" != *$'\t'* ]]; then
+      log "error: could not read GGUF metadata after download: $filename -- skipping this model and removing invalid file"
+      rm -f -- "$destination"
+      return 1
+    fi
   fi
-  [[ "$model_metadata" == *$'\t'* ]] || die "could not detect architecture and context length: $filename"
   model_architecture="${model_metadata%%$'\t'*}"
   detected_context_size="${model_metadata#*$'\t'}"
   advertised_context_size="${CONTEXT_SIZE:-$detected_context_size}"
@@ -204,7 +245,29 @@ for model_spec in "${MODEL_NAMES[@]}"; do
     printf 'cache-type-v = %s\n' "$kv_type"
     printf '\n'
   } > "$PRESET_TMP_DIR/$alias_name.ini"
+
+  allowed_files["$filename"]=1
+  return 0
+}
+
+for model_spec_raw in "${MODEL_NAMES[@]}"; do
+  # Remove leading/trailing whitespace
+  model_spec_trimmed="$(echo "$model_spec_raw" | xargs)"
+  [[ -n "$model_spec_trimmed" ]] || continue
+
+  if process_model_spec "$model_spec_trimmed"; then
+    model_success_count=$((model_success_count + 1))
+  else
+    skipped_models+=("$model_spec_trimmed")
+    log "Skipped model: $model_spec_trimmed"
+  fi
 done
+
+if ((${#skipped_models[@]} > 0)); then
+  log "Skipped ${#skipped_models[@]} model(s) due to errors: ${skipped_models[*]}"
+fi
+
+((model_success_count > 0)) || die "no models were successfully prepared (all ${#MODEL_NAMES[@]} entries failed or were skipped)"
 
 # リストにない .gguf ファイル（使わなくなったモデル）をディスクから削除
 shopt -s nullglob
@@ -238,4 +301,8 @@ if curl --fail --silent "http://127.0.0.1:${LLAMA_ROUTER_PORT}/models?reload=1" 
   log "Reloaded models-preset on llama-server"
 fi
 
-log "Model sync completed successfully. Active models in list: ${!allowed_files[*]}"
+if ((${#skipped_models[@]} > 0)); then
+  log "Model sync completed with ${#skipped_models[@]} model(s) skipped. Active models in list: ${!allowed_files[*]}"
+else
+  log "Model sync completed successfully. Active models in list: ${!allowed_files[*]}"
+fi

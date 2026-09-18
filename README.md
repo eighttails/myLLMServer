@@ -85,11 +85,13 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 ### 2. モデルリストを変更する
 
 自分が使いたいモデルを指定・変更する場合は、`model_list.txt` を編集します。
-1行につき1つの `Hugging Face リポジトリ名/ファイル名.gguf` を記述します（`#` で始まる行や空行は無視されます）。
+1行につき1つの Hugging Faceのダウンロードリンクを記述します（`#` で始まる行や空行は無視されます）。
 
 ```text
 # model_list.txt の例
-<Hugging Face リポジトリ名>/<ファイル名>.gguf
+https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+https://huggingface.co/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf
+https://huggingface.co/Qwen/Qwen3.8-27B-UD-Q4_K_M.gguf/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf
 ```
 
 編集後、コンテナを再起動せずに `model_list.txt` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
@@ -149,34 +151,34 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 
 `launch-container.sh` 実行前に環境変数を export しておくと、コンテナに引き継がれます。
 
-| 変数名 | デフォルト | 説明 |
-|---|---|---|
-| `IMAGE_NAME` | `my-llm-server:latest` | ビルドする Docker イメージ名 |
-| `CONTAINER_NAME` | `my-llm-server` | 作成するコンテナ名 |
-| `MODEL_DIR` | `./models` | モデルダウンロード先(ホスト側パス) |
-| `PORT` | `11434` | 公開ポート |
-| `LLAMA_ROUTER_PORT` | `PORT + 1` | コンテナ内部の llama-server router 用ポート。通常は変更不要 |
-| `PUID` / `PGID` | 実行ユーザーの uid/gid | コンテナ内プロセスの実行ユーザー(ダウンロードファイルの権限をホストと一致させる) |
-| `CUDA_VISIBLE_DEVICES` | (未設定=全GPU) | 使用する GPU を限定したい場合に指定 |
-| `MODEL_LIST_FILE` | `./model_list.txt` | モデルリストを指定するテキストファイルのパス |
-| `MODEL_NAMES_CSV` | (未設定) | `リポジトリ/ファイル名.gguf` のカンマ区切りリスト。指定すると `model_list.txt` より優先されます |
-| `HF_ENDPOINT` | `https://huggingface.co` | モデルダウンロード元エンドポイント |
-| `MODEL_IDLE_SECONDS` | `1800` | この秒数(デフォルト30分)アイドルが続いたモデルは VRAM から解放される |
-| `CONTEXT_SIZE` | (未設定=自動検出) | 全モデル共通のコンテキスト長を固定したい場合に指定。未指定時はモデルの GGUF メタデータ(`<arch>.context_length`)から推奨値を自動検出 |
-| `MAX_CONTEXT_SIZE` | (未設定=上限なし) | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用) |
-| `MIN_CONTEXT_SIZE` | `2048` | KV キャッシュが VRAM に収まらず自動でコンテキスト長を切り詰める際の下限。これを下回る場合のみ `--fit` にフォールバックする |
-| `CONTEXT_SIZE_STEP` | `1024` | コンテキスト長を自動で切り詰める際の丸め単位 |
-| `N_GPU_LAYERS` | `auto` | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる |
-| `MODELS_MAX` | `1` | 同時にロードしておくモデル数の上限(router mode) |
-| `FLASH_ATTN` | `on` | Flash Attentionの使用設定。`on`/`off`/`auto`を指定可能 |
-| `BATCH_SIZE` | `1024` | prompt処理の論理バッチサイズ。llama.cpp既定値の2048より小さくして一時的なVRAM使用量を抑制 |
-| `UBATCH_SIZE` | `256` | prompt処理の物理バッチサイズ。llama.cpp既定値の512より小さくして計算バッファのVRAM使用量を抑制。`BATCH_SIZE`以下で指定 |
-| `VRAM_RESERVE_MIB` | `4096` | `--fit`と手動`tensor-split`計算でGPUごとに確保する、compute bufferとCUDAワークスペースを含むランタイム用のVRAM余白(MiB) |
-| `MOE_CPU_OFFLOAD` | `auto` | MoE expert重みのCPU配置。`auto`はアクティブexpert比率が閾値以下の場合、KV確保後に収まらないexpert層だけCPUへ配置。`all`はすべてのMoEモデルで同じ調整を有効化、`off`は無効化 |
-| `MOE_ACTIVE_RATIO_THRESHOLD` | `0.125` | `MOE_CPU_OFFLOAD=auto`でCPU配置を有効にする`expert_used_count / expert_count`の上限 |
-| `MOE_RAM_RESERVE_MIB` | `8192` | MoE expert重みをCPUへ配置した後も残すホストRAMの余白(MiB) |
-| `KV_CACHE_TYPE` | (未設定=自動選択) | KVキャッシュの量子化タイプを固定したい場合に指定。KとVは常に同じ型(`cache-type-k` == `cache-type-v`)になるように保証されます。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
-| `TENSOR_SPLIT_MODE` | `auto` | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる |
+| 変数名                       | デフォルト               | 説明                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IMAGE_NAME`                 | `my-llm-server:latest`   | ビルドする Docker イメージ名                                                                                                                                                                                                                                                                                                                                                          |
+| `CONTAINER_NAME`             | `my-llm-server`          | 作成するコンテナ名                                                                                                                                                                                                                                                                                                                                                                    |
+| `MODEL_DIR`                  | `./models`               | モデルダウンロード先(ホスト側パス)                                                                                                                                                                                                                                                                                                                                                    |
+| `PORT`                       | `11434`                  | 公開ポート                                                                                                                                                                                                                                                                                                                                                                            |
+| `LLAMA_ROUTER_PORT`          | `PORT + 1`               | コンテナ内部の llama-server router 用ポート。通常は変更不要                                                                                                                                                                                                                                                                                                                           |
+| `PUID` / `PGID`              | 実行ユーザーの uid/gid   | コンテナ内プロセスの実行ユーザー(ダウンロードファイルの権限をホストと一致させる)                                                                                                                                                                                                                                                                                                      |
+| `CUDA_VISIBLE_DEVICES`       | (未設定=全GPU)           | 使用する GPU を限定したい場合に指定                                                                                                                                                                                                                                                                                                                                                   |
+| `MODEL_LIST_FILE`            | `./model_list.txt`       | モデルリストを指定するテキストファイルのパス                                                                                                                                                                                                                                                                                                                                          |
+| `MODEL_NAMES_CSV`            | (未設定)                 | `リポジトリ/ファイル名.gguf` のカンマ区切りリスト。指定すると `model_list.txt` より優先されます                                                                                                                                                                                                                                                                                       |
+| `HF_ENDPOINT`                | `https://huggingface.co` | モデルダウンロード元エンドポイント                                                                                                                                                                                                                                                                                                                                                    |
+| `MODEL_IDLE_SECONDS`         | `1800`                   | この秒数(デフォルト30分)アイドルが続いたモデルは VRAM から解放される                                                                                                                                                                                                                                                                                                                  |
+| `CONTEXT_SIZE`               | (未設定=自動検出)        | 全モデル共通のコンテキスト長を固定したい場合に指定。未指定時はモデルの GGUF メタデータ(`<arch>.context_length`)から推奨値を自動検出                                                                                                                                                                                                                                                   |
+| `MAX_CONTEXT_SIZE`           | (未設定=上限なし)        | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用)                                                                                                                                                                                                                                                                                                                      |
+| `MIN_CONTEXT_SIZE`           | `2048`                   | KV キャッシュが VRAM に収まらず自動でコンテキスト長を切り詰める際の下限。これを下回る場合のみ `--fit` にフォールバックする                                                                                                                                                                                                                                                            |
+| `CONTEXT_SIZE_STEP`          | `1024`                   | コンテキスト長を自動で切り詰める際の丸め単位                                                                                                                                                                                                                                                                                                                                          |
+| `N_GPU_LAYERS`               | `auto`                   | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる                                                                                                                                                                                                                                                                                     |
+| `MODELS_MAX`                 | `1`                      | 同時にロードしておくモデル数の上限(router mode)                                                                                                                                                                                                                                                                                                                                       |
+| `FLASH_ATTN`                 | `on`                     | Flash Attentionの使用設定。`on`/`off`/`auto`を指定可能                                                                                                                                                                                                                                                                                                                                |
+| `BATCH_SIZE`                 | `1024`                   | prompt処理の論理バッチサイズ。llama.cpp既定値の2048より小さくして一時的なVRAM使用量を抑制                                                                                                                                                                                                                                                                                             |
+| `UBATCH_SIZE`                | `256`                    | prompt処理の物理バッチサイズ。llama.cpp既定値の512より小さくして計算バッファのVRAM使用量を抑制。`BATCH_SIZE`以下で指定                                                                                                                                                                                                                                                                |
+| `VRAM_RESERVE_MIB`           | `4096`                   | `--fit`と手動`tensor-split`計算でGPUごとに確保する、compute bufferとCUDAワークスペースを含むランタイム用のVRAM余白(MiB)                                                                                                                                                                                                                                                               |
+| `MOE_CPU_OFFLOAD`            | `auto`                   | MoE expert重みのCPU配置。`auto`はアクティブexpert比率が閾値以下の場合、KV確保後に収まらないexpert層だけCPUへ配置。`all`はすべてのMoEモデルで同じ調整を有効化、`off`は無効化                                                                                                                                                                                                           |
+| `MOE_ACTIVE_RATIO_THRESHOLD` | `0.125`                  | `MOE_CPU_OFFLOAD=auto`でCPU配置を有効にする`expert_used_count / expert_count`の上限                                                                                                                                                                                                                                                                                                   |
+| `MOE_RAM_RESERVE_MIB`        | `8192`                   | MoE expert重みをCPUへ配置した後も残すホストRAMの余白(MiB)                                                                                                                                                                                                                                                                                                                             |
+| `KV_CACHE_TYPE`              | (未設定=自動選択)        | KVキャッシュの量子化タイプを固定したい場合に指定。KとVは常に同じ型(`cache-type-k` == `cache-type-v`)になるように保証されます。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1` |
+| `TENSOR_SPLIT_MODE`          | `auto`                   | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる                                                                                                             |
 
 ## VRAM 管理の仕組み
 
