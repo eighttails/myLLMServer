@@ -55,6 +55,12 @@ SPLIT_MODE="${SPLIT_MODE:-layer}"
 # 未指定の場合は、空き VRAM とモデルサイズ・コンテキスト長から必要な KV キャッシュ量を見積もり、
 # 収まる範囲でなるべく精度の高い(f16に近い)タイプを自動選択する。
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
+# PROXY系環境変数がホストから引き継がれている場合でも、
+# コンテナ内部の通信(router へのヘルスチェック、proxy のバックエンド通信)が
+# プロキシを経由しないように、127.0.0.1 / localhost を no_proxy に含める。
+no_proxy="${no_proxy:+$no_proxy,}127.0.0.1,localhost"
+NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
+export no_proxy NO_PROXY
 
 log() { printf '[llama-wrapper] %s\n' "$*" >&2; }
 die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
