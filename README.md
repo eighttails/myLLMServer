@@ -90,8 +90,8 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 ```text
 # model_list.txt の例
 https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
-https://huggingface.co/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf
-https://huggingface.co/Qwen/Qwen3.8-27B-UD-Q4_K_M.gguf/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf
+https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf
+https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 ```
 
 編集後、コンテナを再起動せずに `model_list.txt` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
