@@ -695,7 +695,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_reload(self, body):
         with self.server.model_lock:
-            self.log_message("reloading model list from model_list.txt / MODEL_NAMES_CSV...")
+            self.log_message("reloading model list from model_list.yml / MODEL_NAMES_CSV...")
             try:
                 subprocess.run(
                     ["/usr/local/bin/sync-model.sh"],

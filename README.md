@@ -8,7 +8,8 @@ Docker コンテナ上で動かすためのラッパーです。
 ## 特徴
 
 - ホスト環境には Docker 以外の追加インストールが不要(モデルのダウンロード・配置もコンテナ内で完結)
-- `model_list.txt` で指定した Hugging Face 上の GGUF モデルを自動ダウンロード・配置
+- `model_list.yml` で指定した Hugging Face 上のモデルと補助ファイルを自動ダウンロード・配置
+- YAML の `mtp` (ドラフトモデル) / `mmproj` (マルチモーダル投影) をモデルごとに指定し、llama-serverへ自動適用。`imatrix` は自動ダウンロードのみ行う(推論時には使用されない)
 - リストにないモデル(キャッシュ済みファイル)は起動時に自動削除
 - `CUDA_VISIBLE_DEVICES` を参照し、未設定なら全 GPU を使用
 - 一定時間(デフォルト30分、環境変数で変更可)アイドルなモデルは VRAM を自動解放
@@ -24,15 +25,15 @@ Docker コンテナ上で動かすためのラッパーです。
 ├── docker/
 │   ├── Dockerfile        # llama.cpp:full-cuda ベースイメージ + ラッパースクリプト
 │   ├── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・軽量preset生成・llama-server/proxy起動を行う
-│   ├── sync-model.sh     # model_list.txt の読み込み、モデル自動ダウンロード・不要モデル削除を行う
+│   ├── sync-model.sh     # model_list.yml の読み込み、モデル自動ダウンロード・不要モデル削除を行う
 │   ├── configure-model-preset.sh # モデル切替時に重い preset 計算を行う
 │   ├── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
 │   └── unload-model.sh           # コンテナ内からモデルをアンロードするスクリプト
 ├── launch-container.sh    # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
 ├── unload-model.sh        # 外部(ホスト側)からモデルをアンロードするスクリプト
-├── reload-model.sh        # model_list.txt を再ロードし、新規モデルの追加ダウンロード＆不要モデルの削除を行うスクリプト
-├── model_list.txt         # 使用するモデルの指定ファイル (初回起動時に model_list.example から自動作成)
-├── model_list.example     # モデル指定ファイルのサンプル
+├── reload-model.sh        # model_list.yml を再ロードし、モデル・補助ファイルの追加ダウンロード＆不要ファイル削除を行うスクリプト
+├── model_list.yml         # 使用するモデル・補助ファイルの指定ファイル
+├── model_list.example.yml # モデル指定ファイルのサンプル
 ├── continue/
 │   └── config.yaml        # Continue (VS Code拡張) 用のモデル設定サンプル
 └── models/                # モデルダウンロード先 (.gitignore 済み、初回は空でOK)
@@ -47,8 +48,8 @@ Docker コンテナ上で動かすためのラッパーです。
 
 ### 1. 起動
 
-初回起動時、`model_list.txt` が存在しない場合は `model_list.example` から自動作成され、そこに記述されたモデルが使用されます。
-**自分で使いたいモデルを指定する場合は、`model_list.txt` を編集してください。**
+初回起動時、`model_list.yml` が存在しない場合は `model_list.example.yml` から自動作成され、そこに記述されたモデルが使用されます。
+**自分で使いたいモデルを指定する場合は、`model_list.yml` を編集してください。**
 
 ```bash
 ./launch-container.sh
@@ -84,25 +85,27 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 
 ### 2. モデルリストを変更する
 
-自分が使いたいモデルを指定・変更する場合は、`model_list.txt` を編集します。
-1行につき1つの Hugging Faceのダウンロードリンクを記述します（`#` で始まる行や空行は無視されます）。
+自分が使いたいモデルを指定・変更する場合は、`model_list.yml` を編集します。
+`models` 配列の各要素に `url` を指定し、必要なら `mtp` (投機的デコーディング用ドラフトモデル、llama-server の `model-draft` として自動適用)、`mmproj` (マルチモーダル投影、`mmproj` として自動適用) のURLを追加します。`imatrix` (量子化用データ、再量子化などに使う場合のみ) はダウンロードだけ行い、llama-server の推論設定には反映されません(llama-serverに imatrix を読み込む実行時オプションが無いため)。
 
 ```text
-# model_list.txt の例
-https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
-https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_M.gguf
-https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+# model_list.yml の例
+models:
+  - url: https://huggingface.co/<owner>/<repo>/resolve/main/<main>.gguf
+    mtp: https://huggingface.co/<owner>/<repo>/resolve/main/<draft>.gguf
+    mmproj: https://huggingface.co/<owner>/<repo>/resolve/main/mmproj-model-f16.gguf
+    imatrix: https://huggingface.co/<owner>/<repo>/resolve/main/imatrix.dat
 ```
 
-編集後、コンテナを再起動せずに `model_list.txt` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
+編集後、コンテナを再起動せずに `model_list.yml` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
 
 ```bash
 ./reload-model.sh
 ```
 
 このコマンド（または `./launch-container.sh`）を実行すると、以下の処理が自動で行われます:
-- `model_list.txt` に新たに追加されたモデルを Hugging Face から自動ダウンロード
-- インストール済みだが `model_list.txt` に記載のない（今後使わない）モデルをディスク（`models/`）から自動削除
+- `model_list.yml` に新たに追加されたモデル・補助ファイルを Hugging Face から自動ダウンロード
+- インストール済みだが `model_list.yml` に記載のない（今後使わない）モデル・補助ファイルをディスク（`models/`）から自動削除
 - サーバー（llama-server および プロキシ）のモデルリストを即座に更新
 
 また、HTTP API 経由で再ロードをトリガーすることも可能です。
@@ -160,8 +163,7 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `LLAMA_ROUTER_PORT`                                                     | `PORT + 1`               | コンテナ内部の llama-server router 用ポート。通常は変更不要                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `PUID` / `PGID`                                                         | 実行ユーザーの uid/gid   | コンテナ内プロセスの実行ユーザー(ダウンロードファイルの権限をホストと一致させる)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `CUDA_VISIBLE_DEVICES`                                                  | (未設定=全GPU)           | 使用する GPU を限定したい場合に指定                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `MODEL_LIST_FILE`                                                       | `./model_list.txt`       | モデルリストを指定するテキストファイルのパス                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `MODEL_NAMES_CSV`                                                       | (未設定)                 | `リポジトリ/ファイル名.gguf` のカンマ区切りリスト。指定すると `model_list.txt` より優先されます                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `MODEL_LIST_FILE`                                                       | `./model_list.yml`       | YAMLモデルリストのパス                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `HF_ENDPOINT`                                                           | `https://huggingface.co` | モデルダウンロード元エンドポイント                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `http_proxy` / `https_proxy` / `no_proxy` (および大文字版、`all_proxy`) | (未設定=不使用)          | ホスト側のプロキシ設定をコンテナに引き継ぐ。モデルダウンロード(`sync-model.sh` の curl)に使用される。コンテナ内部の通信は常に `127.0.0.1` / `localhost` が `no_proxy` に追加されるためプロキシを回避しない                                                                                                                                                                                                                                                                                                                                                                                  |
 | `MODEL_IDLE_SECONDS`                                                    | `1800`                   | この秒数(デフォルト30分)アイドルが続いたモデルは VRAM から解放される                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |

@@ -1,0 +1,47 @@
+# myLLMServer モデルリスト (YAML形式)
+#
+# models: 配下に1モデルにつき1エントリを記述する。
+#
+# 各エントリのキー:
+#   url      (必須) メインの .gguf ファイルの Hugging Face ダウンロードリンク。
+#            「Copy download link」で取得した
+#            https://huggingface.co/{owner}/{repo}/resolve/main/{filename} 形式のURLを指定する。
+#   mtp      (任意) MTP (Multi-Token Prediction) / 投機的デコーディング用のドラフトモデルのURL。
+#            自動ダウンロードされ、モデル切替時に llama-server の preset へ
+#            `model-draft = <ダウンロード先パス>` として自動適用される。
+#            ※ リポジトリによっては「-mtp.gguf」のようにメインモデル自体に
+#              MTP ヘッドが内蔵されている場合があり、その場合は
+#              mtp: を指定する必要はない (url にそのファイルを指定するだけでよい)。
+#   mmproj   (任意) マルチモーダル (画像入力等) 用の投影モデルのURL。
+#            自動ダウンロードされ、preset へ `mmproj = <ダウンロード先パス>` として自動適用される。
+#   imatrix  (任意) 量子化時に使われた importance matrix データのURL。
+#            自動ダウンロードはされるが、llama-server に imatrix を読み込む推論時オプションは
+#            存在しないため、preset には反映されない (再量子化など別用途で使う場合のみ指定する)。
+#
+# 各URLは、リポジトリの「Files and versions」タブでファイル名を確認して指定すること。
+# `#` で始まる行や空行は無視される。
+
+models:
+  # 通常モデル (mtp/mmproj/imatrix なし)
+  - url: https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+  # MTP内蔵モデル + 別ファイルの mmproj + imatrix を持つ例
+  # (このリポジトリの "-mtp.gguf" はメインモデル自体にMTPヘッドが内蔵されているため、
+  #  mtp: の指定は不要。mmproj / imatrix は別ファイルとして提供されている)
+  # https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/tree/main
+  - url: https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+    mmproj: https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/mmproj-Qwen3.8-27B-BF16.gguf
+    imatrix: https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/resolve/main/imatrix-qwen3.8-27b.gguf
+
+  # メインモデルと別ファイルのドラフトモデル(mtp)・mmprojを組み合わせる例
+  # (mmproj は Q4_0 量子化版が提供されていないため Q8_0 を使用)
+  # https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/tree/main
+  - url: https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-Q4_0.gguf
+    mtp: https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/mtp-gemma-4-26B-A4B-it-Q4_0.gguf
+    mmproj: https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF/resolve/main/mmproj-gemma-4-26B-A4B-it-Q8_0.gguf
+
+  # 同構成の小型モデル (mmproj は Q4_0 量子化版が提供されていないため Q8_0 を使用)
+  # https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/tree/main
+  - url: https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_0.gguf
+    mtp: https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/main/mtp-gemma-4-12B-it-Q4_0.gguf
+    mmproj: https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/main/mmproj-gemma-4-12B-it-Q8_0.gguf

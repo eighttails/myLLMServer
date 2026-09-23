@@ -17,10 +17,10 @@ llama.cpp (llama-server) を Docker コンテナで実行するラッパー。
 | パス                   | 役割                                                                                   |
 | ---------------------- | -------------------------------------------------------------------------------------- |
 | `launch-container.sh`  | ホスト側起動スクリプト (イメージ再ビルド + コンテナ再作成)                             |
-| `reload-model.sh`      | `model_list.txt` を再ロード (追加 DL / 不要モデル削除 / リスト反映)                    |
+| `reload-model.sh`      | `model_list.yml` を再ロード (モデル・補助ファイルの追加 DL / 不要ファイル削除 / リスト反映) |
 | `unload-model.sh`      | ホスト側からモデルを VRAM からアンロード                                               |
-| `model_list.txt`       | ユーザー編集対象のモデル指定ファイル (Hugging Face URL、1行1つ)                        |
-| `model_list.example`   | `model_list.txt` が無い場合の初期値の元 (このファイル自体は変更しない)                 |
+| `model_list.yml`       | ユーザー編集対象のモデル・MTP/mmproj/imatrix指定ファイル                         |
+| `model_list.example.yml` | `model_list.yml` が無い場合の初期値の元                                      |
 | `docker/`              | コンテナイメージの中身 (Dockerfile + スクリプト + プロキシ)                            |
 | `models/`              | モデル GGUF のダウンロード先 (.gitignore 済み。**この中のファイルは絶対に編集しない**) |
 | `continue/config.yaml` | Continue (VS Code) 用の設定サンプル                                                    |
@@ -103,4 +103,4 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `500 model name=... failed to load` | `docker logs` で `cudaMalloc failed` を確認。他プロセスの GPU 使用中なら `KV_CACHE_TYPE=q4_0` や `MAX_CONTEXT_SIZE` 制限を提案 |
 | context size exceeded               | リクエストが `ctx-size` を超えていないか。`CONTEXT_SIZE` / `MAX_CONTEXT_SIZE` で調整                                           |
-| モデルがロードされない              | `model_list.txt` の URL 形式 (1行1URL、`#` 行・空行は無視) と `models/` 中の GGUF 名を照合                                     |
+| モデルがロードされない              | `model_list.yml` の `models[].url` と `models/` 中のファイル名を照合                                     |

@@ -1,5 +1,6 @@
 models
 model_list.txt
+model_list.yml
 __pycache__
 *.pyc
 .vscode

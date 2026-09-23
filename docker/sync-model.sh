@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-/models}"
+MODEL_LIST_FILE="${MODEL_LIST_FILE:-$MODEL_DIR/model_list.yml}"
 MODEL_NAMES_CSV="${MODEL_NAMES_CSV:-}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 MODEL_IDLE_SECONDS="${MODEL_IDLE_SECONDS:-1800}"
@@ -105,20 +106,21 @@ download_with_resume() {
   done
 }
 
-# /models/model_list.txt が存在すればそこから最新のモデルリストを読み込む
-if [[ -f "$MODEL_DIR/model_list.txt" ]]; then
-  file_csv="$(awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/' "$MODEL_DIR/model_list.txt" | tr '\n' ',' | sed 's/,$//')"
-  if [[ -n "$file_csv" ]]; then
-    MODEL_NAMES_CSV="$file_csv"
-  fi
-fi
-
-if [[ -n "$MODEL_NAMES_CSV" ]]; then
-  IFS=',' read -r -a MODEL_NAMES <<< "$MODEL_NAMES_CSV"
+MODEL_LIST_FILE="${MODEL_LIST_FILE:-$MODEL_DIR/model_list.yml}"
+MODEL_NAMES=()
+if [[ -f "$MODEL_LIST_FILE" ]]; then
+  while IFS= read -r model_entry; do
+    MODEL_NAMES+=("$model_entry")
+  done < <(model-list-utils.py "$MODEL_LIST_FILE")
+elif [[ -n "$MODEL_NAMES_CSV" ]]; then
+  IFS=',' read -r -a legacy_models <<< "$MODEL_NAMES_CSV"
+  for model_spec in "${legacy_models[@]}"; do
+    MODEL_NAMES+=("$model_spec"$'\t\t\t')
+  done
 else
-  MODEL_NAMES=()
+  die "model_list.yml not found and MODEL_NAMES_CSV is empty"
 fi
-((${#MODEL_NAMES[@]} > 0)) || die "no valid model entries found in model_list.txt or MODEL_NAMES_CSV"
+((${#MODEL_NAMES[@]} > 0)) || die "no valid model entries found in model_list.yml"
 
 mkdir -p "$MODEL_DIR"
 PRESET_TMP_DIR="${PRESET_SECTION_DIR}.tmp"
@@ -147,6 +149,9 @@ skipped_models=()
 # 致命的エラーとせず、そのモデルだけスキップして 1 を返す）
 process_model_spec() {
   local model_spec="$1"
+  local main_url mtp_url mmproj_url imatrix_url
+  IFS=$'\t' read -r main_url mtp_url mmproj_url imatrix_url <<< "$model_spec"
+  model_spec="$main_url"
   local download_url="" filename repo destination alias_name
   local model_metadata cache_key temporary
   local model_architecture detected_context_size advertised_context_size
@@ -185,6 +190,38 @@ process_model_spec() {
   fi
   destination="$MODEL_DIR/$filename"
   alias_name="${filename%.gguf}"
+
+  download_asset() {
+    local asset_url="$1" asset_name asset_destination asset_temporary
+    [[ -n "$asset_url" ]] || return 0
+    asset_name="$(basename "${asset_url%%\?*}")"
+    [[ "$asset_name" == *.gguf || "$asset_name" == *.bin || "$asset_name" == *.dat || "$asset_name" == *.gguf.imatrix ]] ||
+      { log "error: unsupported auxiliary model file: $asset_name"; return 1; }
+    asset_destination="$MODEL_DIR/$asset_name"
+    [[ -f "$asset_destination" ]] && return 0
+    asset_temporary="$asset_destination.part"
+    log "Downloading auxiliary file $asset_name"
+    download_with_resume "$asset_url" "$asset_temporary" "$asset_name" || return 1
+    mv "$asset_temporary" "$asset_destination"
+    return 0
+  }
+
+  for auxiliary_url in "$mtp_url" "$mmproj_url" "$imatrix_url"; do
+    if [[ -n "$auxiliary_url" ]]; then
+      [[ "$auxiliary_url" == https://huggingface.co/* ]] || {
+        log "error: auxiliary URL must be a full Hugging Face URL: $auxiliary_url"
+        return 1
+      }
+      [[ "$auxiliary_url" == *\?* ]] || auxiliary_url="${auxiliary_url}?download=true"
+      download_asset "$auxiliary_url" || return 1
+    fi
+  done
+  mtp_file="${mtp_url##*/}"; mtp_file="${mtp_file%%\?*}"
+  mmproj_file="${mmproj_url##*/}"; mmproj_file="${mmproj_file%%\?*}"
+  imatrix_file="${imatrix_url##*/}"; imatrix_file="${imatrix_file%%\?*}"
+  [[ -n "$mtp_file" ]] && allowed_files["$mtp_file"]=1
+  [[ -n "$mmproj_file" ]] && allowed_files["$mmproj_file"]=1
+  [[ -n "$imatrix_file" ]] && allowed_files["$imatrix_file"]=1
 
   model_metadata=""
   if [[ -f "$destination" ]]; then
@@ -241,6 +278,13 @@ process_model_spec() {
     printf 'sleep-idle-seconds = %s\n' "$MODEL_IDLE_SECONDS"
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
     printf 'ctx-size = %s\n' "$advertised_context_size"
+    # MTP/自己投機的デコーディング用ドラフトモデル (llama-server の preset キー名は model-draft)
+    [[ -n "$mtp_file" ]] && printf 'model-draft = %s\n' "$MODEL_DIR/$mtp_file"
+    # マルチモーダル投影ファイル
+    [[ -n "$mmproj_file" ]] && printf 'mmproj = %s\n' "$MODEL_DIR/$mmproj_file"
+    # imatrix は量子化(llama-imatrix)専用のオフラインデータであり、
+    # llama-server の推論時オプションには存在しないため preset には含めない。
+    # ダウンロードのみ行い、再量子化などの用途に備えて models/ に保持する。
     kv_type="${KV_CACHE_TYPE:-f16}"
     printf 'cache-type-k = %s\n' "$kv_type"
     printf 'cache-type-v = %s\n' "$kv_type"
@@ -253,13 +297,13 @@ process_model_spec() {
 
 for model_spec_raw in "${MODEL_NAMES[@]}"; do
   # Remove leading/trailing whitespace
-  model_spec_trimmed="$(echo "$model_spec_raw" | xargs)"
+  model_spec_trimmed="$model_spec_raw"
   [[ -n "$model_spec_trimmed" ]] || continue
 
   if process_model_spec "$model_spec_trimmed"; then
     model_success_count=$((model_success_count + 1))
   else
-    skipped_models+=("$model_spec_trimmed")
+    skipped_models+=("${model_spec_trimmed%%$'\t'*}")
     log "Skipped model: $model_spec_trimmed"
   fi
 done
@@ -272,7 +316,7 @@ fi
 
 # リストにない .gguf ファイル（使わなくなったモデル）をディスクから削除
 shopt -s nullglob
-for cached_file in "$MODEL_DIR"/*.gguf; do
+for cached_file in "$MODEL_DIR"/*.gguf "$MODEL_DIR"/*.bin "$MODEL_DIR"/*.dat; do
   filename="$(basename "$cached_file")"
   if [[ -z "${allowed_files[$filename]+x}" ]]; then
     log "Removing model not in model_list: $filename"
