@@ -567,6 +567,45 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             "done": False,
         }
 
+    def _accumulate_tool_call_delta(self, accumulator, fragment):
+        """OpenAI streamingのtool_calls断片(index単位で分割されたid/name/argumentsの部分文字列)を
+        indexごとに連結し、完成したtool_callを組み立てる."""
+        if not isinstance(fragment, dict):
+            return
+        index = fragment.get("index", 0)
+        entry = accumulator.setdefault(
+            index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+        )
+        if fragment.get("id"):
+            entry["id"] = fragment["id"]
+        if fragment.get("type"):
+            entry["type"] = fragment["type"]
+        function_fragment = fragment.get("function")
+        if isinstance(function_fragment, dict):
+            if function_fragment.get("name"):
+                entry["function"]["name"] += function_fragment["name"]
+            if function_fragment.get("arguments"):
+                entry["function"]["arguments"] += function_fragment["arguments"]
+
+    def _finalize_tool_calls(self, accumulator):
+        return [
+            converted
+            for converted in (
+                self._openai_tool_call_to_ollama(
+                    {
+                        "id": entry["id"],
+                        "type": entry["type"],
+                        "function": {
+                            "name": entry["function"]["name"],
+                            "arguments": entry["function"]["arguments"],
+                        },
+                    }
+                )
+                for _, entry in sorted(accumulator.items())
+            )
+            if converted is not None
+        ]
+
     def _extract_thinking_mode(self):
         """THINKING_MODE 環境変数を取得する (デフォルト: auto)."""
         return os.environ.get("THINKING_MODE", "auto")
@@ -584,7 +623,11 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         openai_payload = {
             "model": model,
             "messages": self._ollama_messages_to_openai(request_payload.get("messages", [])),
-            "stream": stream and not tools,
+            # tools が付いていても常にバックエンドへストリーミングでリクエストする。
+            # 非ストリーミングで生成完了までブロックすると、長い生成中はクライアントへ
+            # 1バイトも送られず、クライアント側のヘッダー受信タイムアウトで失敗する
+            # (llama-server自体は正常に生成を継続しているにもかかわらず)。
+            "stream": stream,
         }
         if tools:
             openai_payload["tools"] = tools
@@ -613,23 +656,15 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, self._openai_to_ollama_chat_response(model, data))
             return
 
-        if tools:
-            with self._request_backend("POST", "/v1/chat/completions", body=openai_body, headers=headers) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write((json.dumps(self._openai_to_ollama_chat_response(model, data)) + "\n").encode("utf-8"))
-            self.wfile.flush()
-            self.close_connection = True
-            return
-
-        # ストリーミング応答: OpenAI の text/event-stream (SSE) を Ollama の NDJSON に変換する
+        # ストリーミング応答: OpenAI の text/event-stream (SSE) を Ollama の NDJSON に変換する。
+        # tool_calls はOpenAI形式ではindexごとに断片化されて送られてくるため、
+        # ここで蓄積し、[DONE] を受け取った時点でまとめて最終メッセージに含めて送る。
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
         self.end_headers()
+        tool_call_accumulator = {}
+        finish_reason = "stop"
         with self._request_backend("POST", "/v1/chat/completions", body=openai_body, headers=headers) as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
@@ -637,15 +672,6 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 data_str = line[len("data:"):].strip()
                 if data_str == "[DONE]":
-                    final = {
-                        "model": model,
-                        "created_at": self._ollama_now(),
-                        "message": {"role": "assistant", "content": ""},
-                        "done": True,
-                        "done_reason": "stop",
-                    }
-                    self.wfile.write((json.dumps(final) + "\n").encode("utf-8"))
-                    self.wfile.flush()
                     break
                 try:
                     chunk = json.loads(data_str)
@@ -653,9 +679,33 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                     continue
                 if thinking_mode == "off":
                     chunk = self._strip_thinking_from_openai_chunk(chunk)
-                ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
-                self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
-                self.wfile.flush()
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+                if isinstance(choice, dict) and choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                delta_tool_calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+                if isinstance(delta_tool_calls, list):
+                    for fragment in delta_tool_calls:
+                        self._accumulate_tool_call_delta(tool_call_accumulator, fragment)
+                    # tool_calls の断片はここでは送らず、蓄積してから最終メッセージでまとめて送る
+                    continue
+                if delta.get("content"):
+                    ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
+                    self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+        final_message = {"role": "assistant", "content": ""}
+        final_tool_calls = self._finalize_tool_calls(tool_call_accumulator)
+        if final_tool_calls:
+            final_message["tool_calls"] = final_tool_calls
+        final = {
+            "model": model,
+            "created_at": self._ollama_now(),
+            "message": final_message,
+            "done": True,
+            "done_reason": finish_reason,
+        }
+        self.wfile.write((json.dumps(final) + "\n").encode("utf-8"))
+        self.wfile.flush()
         self.close_connection = True
 
     def _handle_unload(self, body):

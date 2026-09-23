@@ -64,7 +64,10 @@ KV キャッシュ量子化や `tensor-split` などの重い計算は起動時�
 `http://localhost:11434/api/tags` でも、登録済みモデル名だけを返します。
 チャット送信用に Ollama 互換の `http://localhost:11434/api/chat` (ストリーミング/非ストリーミング両対応)
 も実装しており、tool calling の `tools` / `tool_calls` を含めて内部で OpenAI 互換 API に変換し、
-`llama-server` へ転送します。
+`llama-server` へ転送します。`tools` を指定したリクエストでも常にバックエンドとはストリーミングで
+通信するため、生成が長時間かかっても応答が届かず接続がタイムアウトすることはありません。
+`tool_calls` はストリーミング中に断片(index単位で分割された name/arguments)を組み立て、
+生成完了時にまとめてクライアントへ返します。
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
