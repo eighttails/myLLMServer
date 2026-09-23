@@ -23,7 +23,7 @@ MODEL_NAMES_CSV="$(awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/' "$MODEL_LIST_FIL
 echo "Using models from $MODEL_LIST_FILE:"
 printf '  %s\n' "${MODEL_NAMES_CSV//,/$'\n  '}"
 
-docker build --tag "$IMAGE_NAME" "$SCRIPT_DIR/docker"
+docker build --pull --tag "$IMAGE_NAME" "$SCRIPT_DIR/docker"
 
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   echo "Removing existing container: $CONTAINER_NAME"
