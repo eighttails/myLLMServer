@@ -70,6 +70,11 @@ KV キャッシュ量子化や `tensor-split` などの重い計算は起動時�
 生成完了時にまとめてクライアントへ返します。推論内容や未完成の `tool_calls` 断片は公開せず、
 空のcontentチャンクを継続して送ります。バックエンドからSSEが届かない推論区間も15秒間隔で
 接続維持チャンクを送るため、長い推論中も接続を維持します。
+Ollamaストリーミング応答では、一定長以上の同一ブロックや同一行が連続する明白な生成ループを
+検出すると、反復部分の転送を止めてllama-server側の生成もキャンセルします。出力トークン数には
+既定の上限を設けないため、反復していない正常な長文生成は継続できます。また、同じtool callと
+同じtool結果を含む1～4ステップの周期が3回続いた場合は、次のtool call生成を始める前にAgentループ
+として停止します。ポーリングなどで結果が変化している場合は同一ループとは判定しません。
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
@@ -189,6 +194,16 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `TENSOR_SPLIT_MODE`                                                     | `auto`                   | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる。`SPLIT_MODE` が `layer` 以外の場合はこの計算自体を行わない                                                                                                                                                                                                                                                       |
 | `SPLIT_MODE`                                                            | `layer`                  | llama-server の `--split-mode`。複数 GPU 間でのモデル分割方式。`layer`(既定): レイヤー単位でGPUに分割するパイプライン並列。1トークン生成中は常にどれか1枚のGPUのみが計算するため、GPU使用率は50%前後(2GPU時)に留まりやすい仕様。`row`: 各レイヤーの重みを行単位でGPU間に分割するテンソル並列で、全GPUが同時に計算に参加できる。`tensor`: 重みとKVキャッシュの両方を分割(実験的)。`none`: 単一GPUのみ使用。**注意**: `row`/`tensor` は毎レイヤーGPU間の同期が発生するため、NVLink等の高速な相互接続が無い環境(PCIe経由のみ)や性能の異なるGPUの組み合わせでは、`layer` より遅くなることがある |
 | `THINKING_MODE`                                                         | `auto`                   | Qwen3.6-35B-A3B-UD 等の思考型モデルにおける推論プロセスの出力制御。`on`: thinking モードを有効化 (推論プロセスの出力を許可)。`off`: thinking モードを無効化 (推論プロセスの出力を抑制)。`auto` (デフォルト): リクエストに thinking パラメータがあればそれを使用、なければ有効。Ollama 互換・OpenAI 互換の両 API で動作し、リクエスト/レスポンス両方から `reasoning_content`, `thinking_content`, `reasoning`, `thoughts` 等のフィールドを自動で除去します。 |
+| `GENERATION_LOOP_DETECTION`                                             | `on`                     | Ollamaストリーミング応答で、完全一致する本文の反復ループを検出してバックエンド生成を停止する。`off`で無効化 |
+| `GENERATION_LOOP_WINDOW_CHARS`                                          | `16384`                  | 生成ループ検出で保持する末尾文字数。`GENERATION_LOOP_MAX_PATTERN_CHARS * GENERATION_LOOP_REPEAT_COUNT`以上が必要 |
+| `GENERATION_LOOP_MIN_PATTERN_CHARS`                                     | `64`                     | 反復ブロックとして判定する最小文字数。短い単語や定型句の通常の再利用を誤検出しないための下限 |
+| `GENERATION_LOOP_MAX_PATTERN_CHARS`                                     | `2048`                   | 検出対象とする反復ブロック1周期の最大文字数 |
+| `GENERATION_LOOP_REPEAT_COUNT`                                          | `3`                      | 同一ブロックを生成ループと判定する最小連続回数 |
+| `GENERATION_LOOP_MIN_REPEATED_CHARS`                                    | `256`                    | 生成ループと判定する反復区間全体の最小文字数 |
+| `GENERATION_LOOP_LINE_REPEAT_COUNT`                                     | `6`                      | 16文字以上の同一行を生成ループと判定する最小連続行数。反復区間全体は`GENERATION_LOOP_MIN_REPEATED_CHARS`以上必要 |
+| `TOOL_LOOP_DETECTION`                                                   | `on`                     | 同じtool call引数と同じtool結果を含む短周期の反復を受信履歴から検出し、次のバックエンド実行前に停止する。`off`で無効化 |
+| `TOOL_LOOP_REPEAT_COUNT`                                                | `3`                      | 同一tool実行周期をAgentループと判定する連続回数 |
+| `TOOL_LOOP_MAX_CYCLE_LENGTH`                                            | `4`                      | Agentループとして検査するtool実行周期の最大ステップ数 |
 
 ## VRAM 管理の仕組み
 

@@ -27,6 +27,180 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 STREAM_KEEPALIVE_SECONDS = 15
+OLLAMA_SAMPLER_OPTIONS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "typical_p",
+    "repeat_penalty",
+    "repeat_last_n",
+    "presence_penalty",
+    "frequency_penalty",
+    "dry_multiplier",
+    "dry_base",
+    "dry_allowed_length",
+    "dry_penalty_last_n",
+    "seed",
+    "stop",
+}
+
+
+def _env_enabled(name, default="on"):
+    return os.environ.get(name, default) == "on"
+
+
+def _env_int(name, default):
+    return int(os.environ.get(name, str(default)))
+
+
+class TextRepetitionDetector:
+    def __init__(
+        self,
+        window_chars=16384,
+        min_pattern_chars=64,
+        max_pattern_chars=2048,
+        repeat_count=3,
+        min_repeated_chars=256,
+        line_repeat_count=6,
+    ):
+        self.window_chars = window_chars
+        self.min_pattern_chars = min_pattern_chars
+        self.max_pattern_chars = max_pattern_chars
+        self.repeat_count = repeat_count
+        self.min_repeated_chars = min_repeated_chars
+        self.line_repeat_count = line_repeat_count
+        self.buffer = ""
+        self.pending_chars = 0
+        self.check_interval = min(64, min_pattern_chars)
+
+    @classmethod
+    def from_environment(cls):
+        return cls(
+            window_chars=_env_int("GENERATION_LOOP_WINDOW_CHARS", 16384),
+            min_pattern_chars=_env_int("GENERATION_LOOP_MIN_PATTERN_CHARS", 64),
+            max_pattern_chars=_env_int("GENERATION_LOOP_MAX_PATTERN_CHARS", 2048),
+            repeat_count=_env_int("GENERATION_LOOP_REPEAT_COUNT", 3),
+            min_repeated_chars=_env_int("GENERATION_LOOP_MIN_REPEATED_CHARS", 256),
+            line_repeat_count=_env_int("GENERATION_LOOP_LINE_REPEAT_COUNT", 6),
+        )
+
+    def append(self, text):
+        if not text:
+            return None
+        self.buffer = (self.buffer + text)[-self.window_chars:]
+        self.pending_chars += len(text)
+        if self.pending_chars < self.check_interval:
+            return None
+        self.pending_chars = 0
+        return self._detect()
+
+    def _detect(self):
+        line_match = self._detect_repeated_line()
+        if line_match:
+            return line_match
+
+        max_period = min(self.max_pattern_chars, len(self.buffer) // self.repeat_count)
+        for period in range(self.min_pattern_chars, max_period + 1):
+            repetitions = max(
+                self.repeat_count,
+                (self.min_repeated_chars + period - 1) // period,
+            )
+            repeated_length = period * repetitions
+            if repeated_length > len(self.buffer):
+                continue
+            pattern = self.buffer[-period:]
+            if not pattern.strip():
+                continue
+            repeated = self.buffer[-repeated_length:]
+            if repeated == pattern * repetitions:
+                return {
+                    "kind": "repeated-block",
+                    "pattern_chars": period,
+                    "repeat_count": repetitions,
+                    "repeated_chars": repeated_length,
+                }
+        return None
+
+    def _detect_repeated_line(self):
+        lines = self.buffer.splitlines()
+        if len(lines) < self.line_repeat_count:
+            return None
+        line = lines[-1]
+        if len(line.strip()) < 16:
+            return None
+        count = 1
+        for previous in reversed(lines[:-1]):
+            if previous != line:
+                break
+            count += 1
+        repeated_chars = len(line) * count
+        if count < self.line_repeat_count or repeated_chars < self.min_repeated_chars:
+            return None
+        return {
+            "kind": "repeated-line",
+            "pattern_chars": len(line),
+            "repeat_count": count,
+            "repeated_chars": repeated_chars,
+        }
+
+
+def _canonical_tool_value(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return value.strip()
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _tool_call_signature(tool_call):
+    if not isinstance(tool_call, dict):
+        return None
+    function = tool_call.get("function")
+    if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+        return None
+    return function["name"], _canonical_tool_value(function.get("arguments", {}))
+
+
+def detect_tool_result_cycle(messages, repeat_count=3, max_cycle_length=4):
+    completed_calls = []
+    pending_calls = []
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            pending_calls = [
+                signature
+                for signature in (
+                    _tool_call_signature(tool_call)
+                    for tool_call in message.get("tool_calls", [])
+                )
+                if signature is not None
+            ]
+        elif role == "tool" and pending_calls:
+            completed_calls.append((pending_calls.pop(0), _canonical_tool_value(message.get("content", ""))))
+
+    for cycle_length in range(1, min(max_cycle_length, len(completed_calls) // repeat_count) + 1):
+        cycle = completed_calls[-cycle_length:]
+        if completed_calls[-cycle_length * repeat_count:] == cycle * repeat_count:
+            return {
+                "cycle_length": cycle_length,
+                "repeat_count": repeat_count,
+                "tool_names": [call[0][0] for call in cycle],
+            }
+    return None
+
+
+def apply_ollama_options(openai_payload, options):
+    if not isinstance(options, dict):
+        return
+    for option in OLLAMA_SAMPLER_OPTIONS:
+        if option in options:
+            openai_payload[option] = options[option]
+    if "num_predict" in options:
+        openai_payload["max_tokens"] = options["num_predict"]
 
 
 class LazyProxy(http.server.ThreadingHTTPServer):
@@ -664,6 +838,51 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         """THINKING_MODE 環境変数を取得する (デフォルト: auto)."""
         return os.environ.get("THINKING_MODE", "auto")
 
+    def _send_tool_loop_stop(self, model, stream, detection):
+        message = (
+            "同じtool callと結果の反復を検出したため、無限ループを防ぐために実行を停止しました。"
+        )
+        self.log_message(
+            "tool loop detected; stopping before backend request: cycle_length=%d repeats=%d tools=%s",
+            detection["cycle_length"],
+            detection["repeat_count"],
+            ",".join(detection["tool_names"]),
+        )
+        if not stream:
+            self._send_json(
+                200,
+                {
+                    "model": model,
+                    "created_at": self._ollama_now(),
+                    "message": {"role": "assistant", "content": message},
+                    "done": True,
+                    "done_reason": "stop",
+                },
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        chunk = {
+            "model": model,
+            "created_at": self._ollama_now(),
+            "message": {"role": "assistant", "content": message},
+            "done": False,
+        }
+        final = {
+            "model": model,
+            "created_at": self._ollama_now(),
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "done_reason": "stop",
+        }
+        self.wfile.write((json.dumps(chunk) + "\n").encode("utf-8"))
+        self.wfile.write((json.dumps(final) + "\n").encode("utf-8"))
+        self.wfile.flush()
+        self.close_connection = True
+
     def _handle_ollama_chat(self, body, model):
         try:
             request_payload = json.loads(body.decode("utf-8")) if body else {}
@@ -674,6 +893,16 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         stream = bool(request_payload.get("stream", True))
         thinking_mode = self._extract_thinking_mode()
         tools = request_payload.get("tools")
+        if tools and _env_enabled("TOOL_LOOP_DETECTION"):
+            tool_loop = detect_tool_result_cycle(
+                request_payload.get("messages", []),
+                repeat_count=_env_int("TOOL_LOOP_REPEAT_COUNT", 3),
+                max_cycle_length=_env_int("TOOL_LOOP_MAX_CYCLE_LENGTH", 4),
+            )
+            if tool_loop:
+                self._send_tool_loop_stop(model, stream, tool_loop)
+                return
+
         openai_payload = {
             "model": model,
             "messages": self._ollama_messages_to_openai(request_payload.get("messages", [])),
@@ -687,13 +916,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             openai_payload["tools"] = tools
         if "tool_choice" in request_payload:
             openai_payload["tool_choice"] = request_payload["tool_choice"]
-        options = request_payload.get("options") or {}
-        if "temperature" in options:
-            openai_payload["temperature"] = options["temperature"]
-        if "top_p" in options:
-            openai_payload["top_p"] = options["top_p"]
-        if "num_predict" in options:
-            openai_payload["max_tokens"] = options["num_predict"]
+        apply_ollama_options(openai_payload, request_payload.get("options"))
 
         # thinking / reasoning 関連パラメータを削除 (THINKING_MODE=off 時 or llama-server が未対応の場合)
         openai_payload.pop("thinking", None)
@@ -719,10 +942,16 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         tool_call_accumulator = {}
         finish_reason = "stop"
+        repetition_detector = (
+            TextRepetitionDetector.from_environment()
+            if _env_enabled("GENERATION_LOOP_DETECTION")
+            else None
+        )
+        backend_stream = self._iter_backend_stream(
+            "POST", "/v1/chat/completions", body=openai_body, headers=headers
+        )
         try:
-            for raw_line in self._iter_backend_stream(
-                "POST", "/v1/chat/completions", body=openai_body, headers=headers
-            ):
+            for raw_line in backend_stream:
                 if raw_line is None:
                     ollama_chunk = self._openai_chunk_to_ollama_chunk(model, {})
                     self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
@@ -748,6 +977,22 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 if isinstance(delta_tool_calls, list):
                     for fragment in delta_tool_calls:
                         self._accumulate_tool_call_delta(tool_call_accumulator, fragment)
+                content = delta.get("content") if isinstance(delta, dict) else None
+                repetition = (
+                    repetition_detector.append(content)
+                    if repetition_detector is not None and isinstance(content, str)
+                    else None
+                )
+                if repetition:
+                    self.log_message(
+                        "generation loop detected; cancelling backend: kind=%s pattern_chars=%d repeats=%d repeated_chars=%d",
+                        repetition["kind"],
+                        repetition["pattern_chars"],
+                        repetition["repeat_count"],
+                        repetition["repeated_chars"],
+                    )
+                    finish_reason = "stop"
+                    break
                 # reasoning や tool_calls の断片も空 content の有効な Ollama チャンクとして送る。
                 # 未完成の内容は公開せず、長い推論中もクライアントの本文無通信タイムアウトを防ぐ。
                 ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
@@ -768,6 +1013,8 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             self.log_message("client disconnected during streaming response")
+        finally:
+            backend_stream.close()
         self.close_connection = True
 
     def _handle_unload(self, body):

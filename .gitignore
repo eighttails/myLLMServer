@@ -4,3 +4,4 @@ model_list.yml
 __pycache__
 *.pyc
 .vscode
+.venv
