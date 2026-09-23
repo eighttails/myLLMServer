@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import configparser
+import http.client
 import http.server
 import json
 import os
+import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -23,6 +26,7 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+STREAM_KEEPALIVE_SECONDS = 15
 
 
 class LazyProxy(http.server.ThreadingHTTPServer):
@@ -187,6 +191,56 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             method=method,
         )
         return urllib.request.urlopen(req, timeout=None)
+
+    def _iter_backend_stream(self, method, path, body=b"", headers=None):
+        events = queue.Queue()
+        stop_event = threading.Event()
+        response_holder = {}
+
+        def read_backend():
+            try:
+                with self._request_backend(method, path, body=body, headers=headers) as resp:
+                    response_holder["response"] = resp
+                    if stop_event.is_set():
+                        return
+                    for raw_line in resp:
+                        if stop_event.is_set():
+                            break
+                        events.put(("line", raw_line))
+            except (OSError, http.client.HTTPException) as err:
+                if not stop_event.is_set():
+                    events.put(("error", err))
+            finally:
+                response_holder.pop("response", None)
+                events.put(("done", None))
+
+        reader = threading.Thread(target=read_backend, daemon=True)
+        reader.start()
+        try:
+            while True:
+                try:
+                    event, payload = events.get(timeout=STREAM_KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    yield None
+                    continue
+                if event == "line":
+                    yield payload
+                elif event == "error":
+                    raise payload
+                else:
+                    break
+        finally:
+            stop_event.set()
+            response = response_holder.get("response")
+            if response is not None:
+                raw = getattr(getattr(response, "fp", None), "raw", None)
+                backend_socket = getattr(raw, "_sock", None)
+                if backend_socket is not None:
+                    try:
+                        backend_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+            reader.join(timeout=1)
 
     def _backend_json(self, method, path, payload=None):
         body = b""
@@ -665,8 +719,15 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         tool_call_accumulator = {}
         finish_reason = "stop"
-        with self._request_backend("POST", "/v1/chat/completions", body=openai_body, headers=headers) as resp:
-            for raw_line in resp:
+        try:
+            for raw_line in self._iter_backend_stream(
+                "POST", "/v1/chat/completions", body=openai_body, headers=headers
+            ):
+                if raw_line is None:
+                    ollama_chunk = self._openai_chunk_to_ollama_chunk(model, {})
+                    self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                    continue
                 line = raw_line.decode("utf-8").strip()
                 if not line or not line.startswith("data:"):
                     continue
@@ -692,19 +753,21 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
                 self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
                 self.wfile.flush()
-        final_message = {"role": "assistant", "content": ""}
-        final_tool_calls = self._finalize_tool_calls(tool_call_accumulator)
-        if final_tool_calls:
-            final_message["tool_calls"] = final_tool_calls
-        final = {
-            "model": model,
-            "created_at": self._ollama_now(),
-            "message": final_message,
-            "done": True,
-            "done_reason": finish_reason,
-        }
-        self.wfile.write((json.dumps(final) + "\n").encode("utf-8"))
-        self.wfile.flush()
+            final_message = {"role": "assistant", "content": ""}
+            final_tool_calls = self._finalize_tool_calls(tool_call_accumulator)
+            if final_tool_calls:
+                final_message["tool_calls"] = final_tool_calls
+            final = {
+                "model": model,
+                "created_at": self._ollama_now(),
+                "message": final_message,
+                "done": True,
+                "done_reason": finish_reason,
+            }
+            self.wfile.write((json.dumps(final) + "\n").encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.log_message("client disconnected during streaming response")
         self.close_connection = True
 
     def _handle_unload(self, body):
