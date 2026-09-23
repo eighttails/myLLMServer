@@ -55,6 +55,11 @@ SPLIT_MODE="${SPLIT_MODE:-layer}"
 # 未指定の場合は、空き VRAM とモデルサイズ・コンテキスト長から必要な KV キャッシュ量を見積もり、
 # 収まる範囲でなるべく精度の高い(f16に近い)タイプを自動選択する。
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
+# thinking モードの制御 (Qwen3.6-35B-A3B-UD 等の思考型モデル用)
+# on:  thinking モードを有効化 (デフォルト、モデルがサポートしている場合)
+# off: thinking モードを無効化 (推論プロセスの出力を抑制)
+# auto: リクエストに thinking パラメータがあればそれを使用、なければ有効
+THINKING_MODE="${THINKING_MODE:-auto}"
 # PROXY系環境変数がホストから引き継がれている場合でも、
 # コンテナ内部の通信(router へのヘルスチェック、proxy のバックエンド通信)が
 # プロキシを経由しないように、127.0.0.1 / localhost を no_proxy に含める。
@@ -84,6 +89,7 @@ awk -v value="$MOE_ACTIVE_RATIO_THRESHOLD" 'BEGIN { exit !(value > 0 && value <=
 [[ "$MOE_RAM_RESERVE_MIB" =~ ^[0-9]+$ ]] || die "MOE_RAM_RESERVE_MIB must be a non-negative integer"
 [[ "$TENSOR_SPLIT_MODE" == "auto" || "$TENSOR_SPLIT_MODE" == "off" ]] || die "TENSOR_SPLIT_MODE must be 'auto' or 'off'"
 [[ "$SPLIT_MODE" == "none" || "$SPLIT_MODE" == "layer" || "$SPLIT_MODE" == "row" || "$SPLIT_MODE" == "tensor" ]] || die "SPLIT_MODE must be 'none', 'layer', 'row', or 'tensor'"
+[[ "$THINKING_MODE" == "on" || "$THINKING_MODE" == "off" || "$THINKING_MODE" == "auto" ]] || die "THINKING_MODE must be 'on', 'off', or 'auto'"
 case "$KV_CACHE_TYPE" in
   ""|f32|f16|bf16|q8_0|q4_0|q4_1|iq4_nl|q5_0|q5_1) ;;
   *) die "KV_CACHE_TYPE must be one of: f32 f16 bf16 q8_0 q4_0 q4_1 iq4_nl q5_0 q5_1" ;;
@@ -98,16 +104,25 @@ MODEL_ALIAS_FILE="$MODEL_DIR/.model-aliases.tsv"
 available_models="$(cut -f1 "$MODEL_ALIAS_FILE" | paste -sd' ' -)"
 log "Starting OpenAI-compatible llama-server router on internal port $LLAMA_ROUTER_PORT"
 log "Available models: $available_models (models-max=$MODELS_MAX)"
-llama-server \
-  --models-preset "$PRESET_FILE" \
-  --models-max "$MODELS_MAX" \
-  --flash-attn "$FLASH_ATTN" \
-  --batch-size "$BATCH_SIZE" \
-  --ubatch-size "$UBATCH_SIZE" \
-  --kv-unified \
-  --fit-target "$VRAM_RESERVE_MIB" \
-  --host 127.0.0.1 \
-  --port "$LLAMA_ROUTER_PORT" &
+
+# Build command arguments for llama-server
+cmd=(llama-server)
+cmd+=(--models-preset "$PRESET_FILE")
+cmd+=(--models-max "$MODELS_MAX")
+cmd+=(--flash-attn "$FLASH_ATTN")
+cmd+=(--batch-size "$BATCH_SIZE")
+cmd+=(--ubatch-size "$UBATCH_SIZE")
+cmd+=(--kv-unified)
+cmd+=(--fit-target "$VRAM_RESERVE_MIB")
+cmd+=(--host 127.0.0.1)
+cmd+=(--port "$LLAMA_ROUTER_PORT")
+
+case "$THINKING_MODE" in
+  off) cmd+=(--reasoning off) ;;
+  on)  cmd+=(--reasoning on) ;;
+esac
+
+"${cmd[@]}" &
 router_pid=$!
 
 cleanup() {

@@ -262,6 +262,24 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         elif "Content-Length" in headers:
             headers.pop("Content-Length", None)
 
+        # thinking モード無効化時: /v1/chat/completions のリクエストから thinking/reasoning パラメータを削除
+        thinking_mode = self._extract_thinking_mode()
+        if thinking_mode == "off" and self.command == "POST" and "/v1/chat/completions" in target_path:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if isinstance(payload, dict):
+                    payload.pop("thinking", None)
+                    payload.pop("reasoning", None)
+                    # messages 内の reasoning_content / thinking_content も削除
+                    for msg in payload.get("messages", []):
+                        if isinstance(msg, dict):
+                            msg.pop("reasoning_content", None)
+                            msg.pop("thinking_content", None)
+                    body = json.dumps(payload).encode("utf-8")
+                    headers["Content-Length"] = str(len(body))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
         try:
             with self._request_backend(self.command, target_path, body=body, headers=headers) as resp:
                 self.send_response(resp.status)
@@ -439,6 +457,10 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             if not isinstance(message, dict):
                 continue
             openai_message = dict(message)
+            # thinking モード無効化時は、reasoning_content / thinking_content を削除
+            if self._extract_thinking_mode() == "off":
+                openai_message.pop("reasoning_content", None)
+                openai_message.pop("thinking_content", None)
             tool_calls = openai_message.get("tool_calls")
             if isinstance(tool_calls, list):
                 converted_tool_calls = []
@@ -498,6 +520,40 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             "eval_duration": int(timings.get("predicted_ms", 0) * 1_000_000),
         }
 
+    def _strip_thinking_from_openai_response(self, payload):
+        """thinking モード無効化時に、レスポンスから推論プロセス (reasoning/thinking) を削除する."""
+        if not isinstance(payload, dict):
+            return payload
+        for choice in payload.get("choices", []):
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message", {})
+            if not isinstance(message, dict):
+                continue
+            # reasoning_content や thinking_content を削除
+            for key in ("reasoning_content", "thinking_content", "reasoning", "thoughts"):
+                message.pop(key, None)
+            # tool_calls の中の reasoning も削除
+            for tool_call in message.get("tool_calls", []):
+                if isinstance(tool_call, dict):
+                    tool_call.pop("reasoning", None)
+                    tool_call.pop("thinking", None)
+        return payload
+
+    def _strip_thinking_from_openai_chunk(self, chunk):
+        """thinking モード無効化時に、ストリーミングチャンクから推論プロセスを削除する."""
+        if not isinstance(chunk, dict):
+            return chunk
+        for choice in chunk.get("choices", []):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta", {})
+            if not isinstance(delta, dict):
+                continue
+            for key in ("reasoning_content", "thinking_content", "reasoning", "thoughts"):
+                delta.pop(key, None)
+        return chunk
+
     def _openai_chunk_to_ollama_chunk(self, model, chunk):
         choice = (chunk.get("choices") or [{}])[0]
         delta = choice.get("delta", {})
@@ -511,6 +567,10 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             "done": False,
         }
 
+    def _extract_thinking_mode(self):
+        """THINKING_MODE 環境変数を取得する (デフォルト: auto)."""
+        return os.environ.get("THINKING_MODE", "auto")
+
     def _handle_ollama_chat(self, body, model):
         try:
             request_payload = json.loads(body.decode("utf-8")) if body else {}
@@ -519,6 +579,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         stream = bool(request_payload.get("stream", True))
+        thinking_mode = self._extract_thinking_mode()
         tools = request_payload.get("tools")
         openai_payload = {
             "model": model,
@@ -537,12 +598,18 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         if "num_predict" in options:
             openai_payload["max_tokens"] = options["num_predict"]
 
+        # thinking / reasoning 関連パラメータを削除 (THINKING_MODE=off 時 or llama-server が未対応の場合)
+        openai_payload.pop("thinking", None)
+        openai_payload.pop("reasoning", None)
+
         openai_body = json.dumps(openai_payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Content-Length": str(len(openai_body))}
 
         if not stream:
             with self._request_backend("POST", "/v1/chat/completions", body=openai_body, headers=headers) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            if thinking_mode == "off":
+                data = self._strip_thinking_from_openai_response(data)
             self._send_json(200, self._openai_to_ollama_chat_response(model, data))
             return
 
@@ -584,6 +651,8 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                if thinking_mode == "off":
+                    chunk = self._strip_thinking_from_openai_chunk(chunk)
                 ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
                 self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
                 self.wfile.flush()
