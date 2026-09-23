@@ -687,12 +687,11 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 if isinstance(delta_tool_calls, list):
                     for fragment in delta_tool_calls:
                         self._accumulate_tool_call_delta(tool_call_accumulator, fragment)
-                    # tool_calls の断片はここでは送らず、蓄積してから最終メッセージでまとめて送る
-                    continue
-                if delta.get("content"):
-                    ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
-                    self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
-                    self.wfile.flush()
+                # reasoning や tool_calls の断片も空 content の有効な Ollama チャンクとして送る。
+                # 未完成の内容は公開せず、長い推論中もクライアントの本文無通信タイムアウトを防ぐ。
+                ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
+                self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
+                self.wfile.flush()
         final_message = {"role": "assistant", "content": ""}
         final_tool_calls = self._finalize_tool_calls(tool_call_accumulator)
         if final_tool_calls:
