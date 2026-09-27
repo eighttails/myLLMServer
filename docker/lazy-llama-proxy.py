@@ -293,7 +293,13 @@ class LazyProxy(http.server.ThreadingHTTPServer):
         try:
             with open(section_file, "r", encoding="utf-8") as handle:
                 parser.read_file(handle)
-            context_length = parser.getint(entry["alias"], "ctx-size")
+            section = entry["alias"]
+            # ctx-size は全スロット合計の KV プールサイズであり、1 リクエストが使える上限では
+            # ない。スロットごとの上限が指定されていればそちらを公開する。
+            if parser.has_option(section, "kv-unified-per-slot"):
+                context_length = parser.getint(section, "kv-unified-per-slot")
+            else:
+                context_length = parser.getint(section, "ctx-size")
         except (OSError, configparser.Error, ValueError) as err:
             raise RuntimeError(
                 f"failed to read context length for model {entry['alias']}: {err}"

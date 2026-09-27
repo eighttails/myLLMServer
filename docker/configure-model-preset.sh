@@ -9,6 +9,7 @@ MIN_CONTEXT_SIZE="${MIN_CONTEXT_SIZE:-2048}"
 CONTEXT_SIZE_STEP="${CONTEXT_SIZE_STEP:-1024}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
+MAX_PARALLEL_SLOTS="${MAX_PARALLEL_SLOTS:-4}"
 KV_CACHE_TYPE="${KV_CACHE_TYPE:-}"
 TENSOR_SPLIT_MODE="${TENSOR_SPLIT_MODE:-auto}"
 SPLIT_MODE="${SPLIT_MODE:-layer}"
@@ -160,6 +161,42 @@ select_kv_cache_type() {
   fi
   log "$(basename "$model_file"): cannot fit q4_0 KV cache even at MIN_CONTEXT_SIZE=$MIN_CONTEXT_SIZE; falling back to --fit"
   echo ""
+}
+
+# 同時実行スロット数を求める。
+# llama-server の KV キャッシュは全スロットで共有されるため、スロット数を増やすと
+# 「個々のリクエストは ctx-size 未満なのに合算で溢れる」状態になりうる。
+# そこで「各スロットが ctx_size を丸ごと確保できる本数」だけを返し、
+# 予算が 1 本分しかなければ 1 (= 逐次実行) に固定する。
+compute_parallel_slots() {
+  local model_file="$1" ctx_size="$2" cache_type="$3" free_bytes="$4" model_bytes="$5"
+  local params block_count head_count_kv key_length value_length
+  local bytes_per_elem budget_bytes slots
+
+  ((MAX_PARALLEL_SLOTS > 1)) || { echo 1; return; }
+  ((free_bytes > 0)) || { echo 1; return; }
+
+  params="$(detect_kv_cache_params "$model_file")"
+  if [[ -z "$params" ]]; then
+    echo 1
+    return
+  fi
+  read -r block_count head_count_kv key_length value_length <<< "$params"
+
+  bytes_per_elem="$(kv_cache_type_bytes_per_element "$cache_type")"
+  budget_bytes="$(awk -v f="$free_bytes" -v m="$model_bytes" 'BEGIN { b = (f - m) * 0.9; if (b < 0) b = 0; printf "%.0f", b }')"
+  slots="$(awk -v bc="$block_count" -v hkv="$head_count_kv" -v kl="$key_length" -v vl="$value_length" \
+    -v ctx="$ctx_size" -v bpe="$bytes_per_elem" -v b="$budget_bytes" -v max="$MAX_PARALLEL_SLOTS" \
+    'BEGIN {
+       per_slot = bc * hkv * (kl + vl) * ctx * bpe
+       if (per_slot <= 0) { print 1; exit }
+       n = int(b / per_slot)
+       if (n < 1) n = 1
+       if (n > max) n = max
+       print n
+     }')"
+  [[ "$slots" =~ ^[0-9]+$ ]] || slots=1
+  echo "$slots"
 }
 
 detect_total_free_vram_bytes() {
@@ -384,6 +421,15 @@ if [[ -z "$model_kv_cache_type" ]]; then
   fi
 fi
 
+# 同時実行スロット数は「各スロットがコンテキスト全量を確保できる」場合にのみ増やす。
+# 以降の VRAM 計算は KV プール全体 (= スロット数 × 1スロット分) を対象にする必要があるため、
+# ここで model_ctx_size を合計値へ引き上げ、1 リクエストあたりの上限は
+# model_ctx_per_slot として保持する。
+model_ctx_per_slot="$model_ctx_size"
+model_parallel="$(compute_parallel_slots "$model_file" "$model_ctx_per_slot" \
+  "${model_kv_cache_type:-${KV_CACHE_TYPE:-f16}}" "$total_free_vram_bytes" "$model_gpu_bytes")"
+model_ctx_size=$((model_ctx_per_slot * model_parallel))
+
 model_tensor_split=""
 model_n_gpu_layers_fixed=""
 if [[ "$model_fit_fallback" == 1 ]]; then
@@ -482,10 +528,29 @@ fi
 
 section_file="$PRESET_SECTION_DIR/$alias_name.ini"
 tmp_section="$(mktemp "$section_file.tmp.XXXXXX")"
+# 手動 tensor-split の探索などで KV プール全体が切り詰められた場合は、
+# 「各スロットにコンテキスト全量」を維持できる本数までスロット数を下げ直す。
+if ((model_ctx_size < model_ctx_per_slot)); then
+  model_parallel=1
+  model_ctx_per_slot="$model_ctx_size"
+else
+  model_parallel=$((model_ctx_size / model_ctx_per_slot))
+  model_ctx_size=$((model_ctx_per_slot * model_parallel))
+fi
+if ((model_parallel > 1)); then
+  log "Allocating $model_parallel parallel slots for $filename (per-slot ctx-size=$model_ctx_per_slot, total ctx-size=$model_ctx_size)"
+else
+  log "Serializing requests for $filename (1 slot, ctx-size=$model_ctx_per_slot)"
+fi
 {
   printf '[%s]\n' "$alias_name"
   printf 'model = %s\n' "$model_file"
   printf 'ctx-size = %s\n' "$model_ctx_size"
+  printf 'parallel = %s\n' "$model_parallel"
+  # --kv-unified では全スロットが 1 本の KV プールを共有し、各スロットには ctx-size 全量が
+  # 使える (n_ctx_slot = ctx-size) と申告されてしまう。1 リクエストがプールを食い潰して
+  # 他のリクエストを "Context size has been exceeded" で落とさないよう上限を明示する。
+  printf 'kv-unified-per-slot = %s\n' "$model_ctx_per_slot"
   printf 'sleep-idle-seconds = %s\n' "$MODEL_IDLE_SECONDS"
   if [[ -n "$model_tensor_split" ]]; then
     printf 'fit = off\n'

@@ -183,6 +183,7 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `CONTEXT_SIZE_STEP`                                                     | `1024`                   | コンテキスト長を自動で切り詰める際の丸め単位                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `N_GPU_LAYERS`                                                          | `auto`                   | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `MODELS_MAX`                                                            | `1`                      | 同時にロードしておくモデル数の上限(router mode)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `MAX_PARALLEL_SLOTS`                                                    | `4`                      | 1 モデルあたりの同時実行スロット数の**上限**。llama-server の KV キャッシュは全スロットで共有されるため、実際のスロット数は「各スロットがコンテキスト長を丸ごと確保できる本数」まで VRAM 見積もりから自動で切り下げられる(1 本分しか確保できなければ 1 = 逐次実行)。`1` を指定すると常に逐次実行になる                                                                                                                                                                                                                                                                                       |
 | `FLASH_ATTN`                                                            | `on`                     | Flash Attentionの使用設定。`on`/`off`/`auto`を指定可能                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `BATCH_SIZE`                                                            | `1024`                   | prompt処理の論理バッチサイズ。llama.cpp既定値の2048より小さくして一時的なVRAM使用量を抑制                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `UBATCH_SIZE`                                                           | `256`                    | prompt処理の物理バッチサイズ。llama.cpp既定値の512より小さくして計算バッファのVRAM使用量を抑制。`BATCH_SIZE`以下で指定                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -212,6 +213,14 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 - **計算バッファと共有KVの省メモリ化**: Flash Attentionを有効にし、`BATCH_SIZE` / `UBATCH_SIZE`を
   llama.cppの既定値より小さくしています。また、`--kv-unified`により並列スロット間で単一のKVバッファを共有します。
   バッチサイズをさらに下げるとVRAMを節約できますが、長いpromptの処理速度は低下します。
+- **同時実行スロット数の自動決定**: `--kv-unified` ではKVバッファが全スロットで共有されるため、スロット数を
+  無条件に増やすと「個々のリクエストは`ctx-size`未満なのに、同時実行の合算で溢れて
+  `Context size has been exceeded` になる」状態が起こります。そこで本サーバは、各スロットがコンテキスト長を
+  丸ごと確保できる本数(= 空きVRAM ÷ 1スロット分のKVキャッシュ量)だけをスロットとして開き、`ctx-size`には
+  その合計値、`kv-unified-per-slot`には1リクエストあたりの上限を指定します。1本分しか確保できない場合は
+  1スロット(逐次実行)となり、1リクエストがコンテキスト全量を使えることが保証されます。上限は
+  `MAX_PARALLEL_SLOTS`で調整できます。手動`tensor-split`の探索でKVプール全体が切り詰められた場合は、
+  コンテキスト全量を維持できる本数までスロット数を下げ直します。
 - **低アクティブ率MoEの自動CPU配置**: GGUFの`expert_count`と`expert_used_count`を調べ、既定では
   1トークンあたりのアクティブexpert比率が12.5%以下なら、まず全expertをCPUへ置ける前提でKVキャッシュを確保します。
   その後`n-cpu-moe`を0から順に試し、KVキャッシュとVRAM余白を維持したまま成立する最小値を採用します。
@@ -283,6 +292,11 @@ models:
 
 - 使用中のモデルの `ctx-size` を超えるトークン数をリクエストしていないか確認してください。
 - `CONTEXT_SIZE` / `MAX_CONTEXT_SIZE` で明示的に増減できます。
+- **個々のリクエストは上限未満なのにこのエラーが出る場合**は、同時実行リクエストの合算で KV キャッシュが
+  溢れている可能性があります。`docker logs` でエラー直前の
+  `slot release: ... stop processing: n_tokens = N` を複数スロット分合計し、`ctx-size` を超えていないか
+  確認してください。本サーバは各スロットにコンテキスト全量を確保できる本数までしかスロットを開かないため
+  通常は起きませんが、`MAX_PARALLEL_SLOTS=1` を指定すると確実に逐次実行へ倒せます。
 
 ### コンテナの状態確認
 

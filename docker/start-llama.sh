@@ -22,6 +22,13 @@ MIN_CONTEXT_SIZE="${MIN_CONTEXT_SIZE:-2048}"
 CONTEXT_SIZE_STEP="${CONTEXT_SIZE_STEP:-1024}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-auto}"
 MODELS_MAX="${MODELS_MAX:-1}"
+# 1 モデルあたりの同時実行スロット数の上限。
+# llama-server の KV キャッシュは全スロットで共有されるため、スロット数を増やすと
+# 個々のリクエストが上限未満でも合算で溢れて "Context size has been exceeded" になる。
+# そのため実際のスロット数は「各スロットにコンテキスト全量を確保できる本数」まで
+# configure-model-preset.sh が VRAM 見積もりから切り下げる (足りなければ 1 = 逐次実行)。
+# 1 を指定すると常に逐次実行になる。
+MAX_PARALLEL_SLOTS="${MAX_PARALLEL_SLOTS:-4}"
 FLASH_ATTN="${FLASH_ATTN:-on}"
 # llama.cpp の既定値(2048/512)より小さくし、prompt処理用の一時VRAMを抑える。
 BATCH_SIZE="${BATCH_SIZE:-1024}"
@@ -92,6 +99,7 @@ die() { printf '[llama-wrapper] error: %s\n' "$*" >&2; exit 1; }
 [[ "$CONTEXT_SIZE_STEP" =~ ^[0-9]+$ ]] && ((CONTEXT_SIZE_STEP > 0)) || die "CONTEXT_SIZE_STEP must be a positive integer"
 [[ "$N_GPU_LAYERS" == "auto" || "$N_GPU_LAYERS" == "all" || "$N_GPU_LAYERS" =~ ^-?[0-9]+$ ]] || die "N_GPU_LAYERS must be an integer, 'auto', or 'all'"
 [[ "$MODELS_MAX" =~ ^[0-9]+$ ]] || die "MODELS_MAX must be an integer"
+[[ "$MAX_PARALLEL_SLOTS" =~ ^[0-9]+$ ]] && ((MAX_PARALLEL_SLOTS >= 1)) || die "MAX_PARALLEL_SLOTS must be a positive integer"
 [[ "$FLASH_ATTN" == "on" || "$FLASH_ATTN" == "off" || "$FLASH_ATTN" == "auto" ]] || die "FLASH_ATTN must be 'on', 'off', or 'auto'"
 [[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] && ((BATCH_SIZE > 0)) || die "BATCH_SIZE must be a positive integer"
 [[ "$UBATCH_SIZE" =~ ^[0-9]+$ ]] && ((UBATCH_SIZE > 0 && UBATCH_SIZE <= BATCH_SIZE)) || die "UBATCH_SIZE must be a positive integer no greater than BATCH_SIZE"
@@ -177,7 +185,7 @@ for _ in $(seq 1 60); do
 done
 ((router_ready == 1)) || die "llama-server router did not become ready"
 
-export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB MOE_CPU_OFFLOAD MOE_ACTIVE_RATIO_THRESHOLD MOE_RAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE SPLIT_MODE
+export MODEL_DIR MODEL_IDLE_SECONDS CONTEXT_SIZE MAX_CONTEXT_SIZE MIN_CONTEXT_SIZE CONTEXT_SIZE_STEP N_GPU_LAYERS MODELS_MAX MAX_PARALLEL_SLOTS FLASH_ATTN BATCH_SIZE UBATCH_SIZE VRAM_RESERVE_MIB MOE_CPU_OFFLOAD MOE_ACTIVE_RATIO_THRESHOLD MOE_RAM_RESERVE_MIB KV_CACHE_TYPE TENSOR_SPLIT_MODE SPLIT_MODE
 export GENERATION_LOOP_DETECTION GENERATION_LOOP_WINDOW_CHARS GENERATION_LOOP_MIN_PATTERN_CHARS GENERATION_LOOP_MAX_PATTERN_CHARS GENERATION_LOOP_REPEAT_COUNT GENERATION_LOOP_MIN_REPEATED_CHARS GENERATION_LOOP_LINE_REPEAT_COUNT
 export TOOL_LOOP_DETECTION TOOL_LOOP_REPEAT_COUNT TOOL_LOOP_MAX_CYCLE_LENGTH
 export PRESET_FILE PRESET_SECTION_DIR MODEL_ALIAS_FILE

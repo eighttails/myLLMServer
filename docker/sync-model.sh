@@ -278,6 +278,10 @@ process_model_spec() {
     printf 'sleep-idle-seconds = %s\n' "$MODEL_IDLE_SECONDS"
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
     printf 'ctx-size = %s\n' "$advertised_context_size"
+    # 同時実行スロット数は configure-model-preset.sh が VRAM 見積もりから決める。
+    # ここでは「1 リクエストにコンテキスト全量を保証する」安全側の 1 を初期値にする。
+    printf 'parallel = 1\n'
+    printf 'kv-unified-per-slot = %s\n' "$advertised_context_size"
     # MTP/自己投機的デコーディング用ドラフトモデル (llama-server の preset キー名は model-draft)
     [[ -n "$mtp_file" ]] && printf 'model-draft = %s\n' "$MODEL_DIR/$mtp_file"
     # マルチモーダル投影ファイル
