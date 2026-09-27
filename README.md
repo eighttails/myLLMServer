@@ -298,6 +298,15 @@ models:
   確認してください。本サーバは各スロットにコンテキスト全量を確保できる本数までしかスロットを開かないため
   通常は起きませんが、`MAX_PARALLEL_SLOTS=1` を指定すると確実に逐次実行へ倒せます。
 
+### `llama-server backend request failed` エラーになる
+
+- エラーメッセージの末尾に llama-server が返した理由が付加されます (ログにも
+  `[llama-proxy] backend request failed: HTTP Error 400: ...: <理由>` として出力されます)。
+- `Cannot have 2 or more assistant messages at the end of the list.` は、クライアントが
+  assistant メッセージを連続して送った場合に llama-server が返すエラーです。Ollama 本家は受理するため、
+  本プロキシは `/api/chat` と `/v1/chat/completions` の両方で連続する assistant メッセージを 1 つに
+  結合してから転送します (ログに `merged N consecutive assistant message(s)` と出力)。
+
 ### コンテナの状態確認
 
 ```bash

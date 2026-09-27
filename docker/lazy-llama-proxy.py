@@ -193,6 +193,61 @@ def detect_tool_result_cycle(messages, repeat_count=3, max_cycle_length=4):
     return None
 
 
+def _merge_message_content(first, second):
+    if first in (None, ""):
+        return second
+    if second in (None, ""):
+        return first
+    if isinstance(first, str) and isinstance(second, str):
+        return first + "\n\n" + second
+    # multimodal (配列形式) が混ざる場合は text パーツへ揃えて連結する
+    def as_parts(value):
+        if isinstance(value, list):
+            return list(value)
+        return [{"type": "text", "text": str(value)}]
+    return as_parts(first) + as_parts(second)
+
+
+def merge_consecutive_assistant_messages(messages):
+    """連続する assistant メッセージを 1 つに結合する.
+
+    llama-server は末尾に assistant が 2 つ以上並ぶリクエストを
+    "Cannot have 2 or more assistant messages at the end of the list." で拒否する
+    (Ollama 本家は受理する)。クライアントが 1 ターンを複数の assistant メッセージに
+    分割して送る場合があるため、互換性維持のためにプロキシ側で結合する。
+    戻り値は (結合後のメッセージ列, 結合した件数)。
+    """
+    merged = []
+    merge_count = 0
+    for message in messages:
+        previous = merged[-1] if merged else None
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(previous, dict)
+            and previous.get("role") == "assistant"
+        ):
+            combined = dict(previous)
+            for key, value in message.items():
+                if key == "role":
+                    continue
+                if key in ("tool_calls", "images"):
+                    existing = combined.get(key)
+                    if isinstance(existing, list) and isinstance(value, list):
+                        combined[key] = existing + value
+                    elif isinstance(value, list) and value:
+                        combined[key] = list(value)
+                elif key in ("content", "reasoning_content", "thinking_content", "thinking"):
+                    combined[key] = _merge_message_content(combined.get(key), value)
+                elif key not in combined:
+                    combined[key] = value
+            merged[-1] = combined
+            merge_count += 1
+        else:
+            merged.append(message)
+    return merged, merge_count
+
+
 def apply_ollama_options(openai_payload, options):
     if not isinstance(options, dict):
         return
@@ -496,12 +551,16 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         elif "Content-Length" in headers:
             headers.pop("Content-Length", None)
 
-        # thinking モード無効化時: /v1/chat/completions のリクエストから thinking/reasoning パラメータを削除
         thinking_mode = self._extract_thinking_mode()
-        if thinking_mode == "off" and self.command == "POST" and "/v1/chat/completions" in target_path:
+        if self.command == "POST" and "/v1/chat/completions" in target_path and body:
             try:
                 payload = json.loads(body.decode("utf-8"))
-                if isinstance(payload, dict):
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                modified = False
+                # thinking モード無効化時: thinking/reasoning パラメータを削除
+                if thinking_mode == "off":
                     payload.pop("thinking", None)
                     payload.pop("reasoning", None)
                     # messages 内の reasoning_content / thinking_content も削除
@@ -509,10 +568,17 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                         if isinstance(msg, dict):
                             msg.pop("reasoning_content", None)
                             msg.pop("thinking_content", None)
+                    modified = True
+                # llama-server が拒否する連続 assistant メッセージを結合
+                if isinstance(payload.get("messages"), list):
+                    messages, merge_count = merge_consecutive_assistant_messages(payload["messages"])
+                    if merge_count:
+                        self.log_message("merged %d consecutive assistant message(s)", merge_count)
+                        payload["messages"] = messages
+                        modified = True
+                if modified:
                     body = json.dumps(payload).encode("utf-8")
                     headers["Content-Length"] = str(len(body))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
 
         try:
             with self._request_backend(self.command, target_path, body=body, headers=headers) as resp:
@@ -540,6 +606,12 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _send_error_json(self, status, message):
+        if getattr(self, "_ndjson_stream_started", False):
+            # ストリーミング応答のヘッダー送信後は Ollama 形式のエラー行として返す
+            self.wfile.write((json.dumps({"error": message}) + "\n").encode("utf-8"))
+            self.wfile.flush()
+            self.close_connection = True
+            return
         self._send_json(status, {"error": message})
 
     def _send_json(self, status, payload):
@@ -719,6 +791,9 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                     )
                 openai_message["tool_calls"] = converted_tool_calls
             openai_messages.append(openai_message)
+        openai_messages, merge_count = merge_consecutive_assistant_messages(openai_messages)
+        if merge_count:
+            self.log_message("merged %d consecutive assistant message(s)", merge_count)
         return openai_messages
 
     def _openai_to_ollama_chat_response(self, model, payload, done_reason="stop"):
@@ -946,6 +1021,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Connection", "close")
         self.end_headers()
+        self._ndjson_stream_started = True
         tool_call_accumulator = {}
         finish_reason = "stop"
         repetition_detector = (
@@ -1117,6 +1193,26 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         except subprocess.CalledProcessError as err:
             self.log_message("failed to prepare model preset: %s", err)
             self._send_error_json(502, f"failed to prepare model preset for {model}")
+        except urllib.error.HTTPError as err:
+            # バックエンドのエラー本文 (例: invalid_request_error の理由) をクライアントへ伝える
+            detail = ""
+            try:
+                raw = err.read().decode("utf-8", errors="replace")
+                try:
+                    parsed_error = json.loads(raw).get("error")
+                    detail = parsed_error.get("message", "") if isinstance(parsed_error, dict) else str(parsed_error or "")
+                except (json.JSONDecodeError, AttributeError):
+                    detail = raw.strip()
+            except OSError:
+                pass
+            self.log_message("backend request failed: %s: %s", err, detail[:500])
+            message = "llama-server backend request failed"
+            if detail:
+                message = f"{message}: {detail}"
+            try:
+                self._send_error_json(err.code if 400 <= err.code < 600 else 502, message)
+            except OSError:
+                pass
         except urllib.error.URLError as err:
             self.log_message("backend request failed: %s", err)
             self._send_error_json(502, "llama-server backend request failed")
