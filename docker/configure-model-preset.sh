@@ -492,7 +492,15 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
             fi
           fi
 
-          if [[ -n "$best_result" ]]; then
+          min_ctx_percent="${TENSOR_SPLIT_MIN_CTX_PERCENT:-75}"
+          min_acceptable_ctx=$(( model_ctx_size * min_ctx_percent / 100 ))
+          if [[ -n "$best_result" ]] && ((best_ctx < min_acceptable_ctx)); then
+            # 全層 GPU 配置のためにコンテキストを大幅に削るより、一部の層を CPU へ
+            # 退避してでもコンテキスト長を維持する方を優先し、--fit に委ねる。
+            log "Manual tensor-split would shrink ctx-size for $filename from $model_ctx_size to $best_ctx (< ${min_ctx_percent}%); keeping ctx-size and falling back to --fit"
+            best_result=""
+            result=""
+          elif [[ -n "$best_result" ]]; then
             log "Shrinking ctx-size for $filename from $model_ctx_size to $best_ctx to enable manual tensor-split"
             model_ctx_size="$best_ctx"
             result="$best_result"
