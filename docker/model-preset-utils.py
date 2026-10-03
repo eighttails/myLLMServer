@@ -49,7 +49,74 @@ def tensor_bytes(shape: list[int], tensor_type: str) -> int:
     return ((count + block_size - 1) // block_size) * type_bytes
 
 
-def read_layer_bytes(exclude_moe: bool = False, split_moe: bool = False) -> int:
+def metadata_value(data: dict, suffix: str):
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return None
+    for key, entry in metadata.items():
+        if not isinstance(key, str) or not key.endswith(suffix):
+            continue
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if isinstance(value, dict):
+            value = value.get("value")
+        return value
+    return None
+
+
+def layer_kv_profile(data: dict) -> tuple[list[tuple[int, bool]], int]:
+    """層ごとの (1トークンあたりの KV 要素数, SWA層か) と sliding window 長を返す。
+
+    - head_count_kv が層ごとの配列の場合は 0 の層 (SSM 等) を除外する
+    - full_attention_interval を持つハイブリッドモデルは (i+1) % interval == 0 の層だけを Attention とする
+    - sliding_window_pattern で SWA と判定された層は key/value_length_swa を使い、
+      llama-server 側でウィンドウ分しか KV を確保しないため別枠で扱う
+    """
+    block_count = metadata_number(data, ".block_count")
+    head_count_kv = metadata_value(data, ".attention.head_count_kv")
+    key_length = metadata_number(data, ".attention.key_length")
+    value_length = metadata_number(data, ".attention.value_length")
+    key_length_swa = metadata_number(data, ".attention.key_length_swa") or key_length
+    value_length_swa = metadata_number(data, ".attention.value_length_swa") or value_length
+    sliding_window = metadata_number(data, ".attention.sliding_window")
+    swa_pattern = metadata_value(data, ".attention.sliding_window_pattern")
+    attention_interval = metadata_number(data, ".full_attention_interval")
+    if not isinstance(swa_pattern, list) or sliding_window <= 0:
+        swa_pattern = []
+
+    layers: list[tuple[int, bool]] = []
+    for index in range(block_count):
+        if isinstance(head_count_kv, list):
+            heads = head_count_kv[index] if index < len(head_count_kv) else 0
+            heads = heads if isinstance(heads, int) and heads > 0 else 0
+        else:
+            heads = head_count_kv if isinstance(head_count_kv, int) else 0
+            if attention_interval > 1 and (index + 1) % attention_interval != 0:
+                heads = 0
+        is_swa = index < len(swa_pattern) and swa_pattern[index] is True
+        lengths = (key_length_swa + value_length_swa) if is_swa else (key_length + value_length)
+        layers.append((heads * lengths, is_swa))
+    return layers, sliding_window
+
+
+def read_kv_profile() -> int:
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 1
+    layers, sliding_window = layer_kv_profile(data)
+    full_elements = sum(elements for elements, is_swa in layers if not is_swa)
+    swa_elements = sum(elements for elements, is_swa in layers if is_swa)
+    if full_elements + swa_elements <= 0:
+        return 1
+    # 量子化 KV の Flash Attention は層ごとに K/V を f16 へ展開する作業領域を使うため、
+    # 1層あたりの最大要素数も返す。
+    max_full = max((elements for elements, is_swa in layers if not is_swa), default=0)
+    max_swa = max((elements for elements, is_swa in layers if is_swa), default=0)
+    print(full_elements, swa_elements, sliding_window, max_full, max_swa)
+    return 0
+
+
+def read_layer_bytes(exclude_moe: bool = False, split_moe: bool = False, split_ffn: bool = False) -> int:
     try:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -58,22 +125,9 @@ def read_layer_bytes(exclude_moe: bool = False, split_moe: bool = False) -> int:
     tensors = data.get("tensors", {})
     if not isinstance(tensors, dict):
         return 1
-    head_count_kv: int | list[int] = 0
+    kv_layers: list[tuple[int, bool]] = []
     if split_moe:
-        metadata = data.get("metadata", {})
-        if isinstance(metadata, dict):
-            for key, entry in metadata.items():
-                if not isinstance(key, str) or not key.endswith(".attention.head_count_kv"):
-                    continue
-                value = entry.get("value") if isinstance(entry, dict) else None
-                if isinstance(value, dict):
-                    value = value.get("value")
-                if isinstance(value, list) and all(isinstance(item, int) for item in value):
-                    head_count_kv = value
-                elif isinstance(value, int):
-                    head_count_kv = value
-                break
-
+        kv_layers, _ = layer_kv_profile(data)
     layer_bytes: dict[int, int] = {}
     layer_moe_bytes: dict[int, int] = {}
     other_bytes = 0
@@ -89,11 +143,17 @@ def read_layer_bytes(exclude_moe: bool = False, split_moe: bool = False) -> int:
         is_moe = bool(re.search(r"\.ffn_.+_exps\.weight$", name))
         if exclude_moe and is_moe:
             continue
+        # split_ffn 時は Dense FFN (--n-cpu-ffn で CPU へ退避できる重み) を退避可能分として分離する
+        is_offloadable = (
+            bool(re.search(r"\.ffn_(up|down|gate|gate_up)\.weight$", name))
+            if split_ffn
+            else is_moe
+        )
         size = tensor_bytes(shape, tensor_type)
         match = re.match(r"^blk\.(\d+)\.", name)
         if match:
             index = int(match.group(1))
-            if split_moe and is_moe:
+            if split_moe and is_offloadable:
                 layer_moe_bytes[index] = layer_moe_bytes.get(index, 0) + size
             else:
                 layer_bytes[index] = layer_bytes.get(index, 0) + size
@@ -106,14 +166,8 @@ def read_layer_bytes(exclude_moe: bool = False, split_moe: bool = False) -> int:
     print(other_bytes)
     for index in sorted(layer_bytes):
         if split_moe:
-            kv_heads = (
-                head_count_kv[index]
-                if isinstance(head_count_kv, list) and index < len(head_count_kv)
-                else head_count_kv
-                if isinstance(head_count_kv, int)
-                else 0
-            )
-            print(layer_bytes[index], layer_moe_bytes.get(index, 0), kv_heads)
+            kv_elements, is_swa = kv_layers[index] if index < len(kv_layers) else (0, False)
+            print(layer_bytes[index], layer_moe_bytes.get(index, 0), kv_elements, int(is_swa))
         else:
             print(layer_bytes[index])
     return 0
@@ -184,7 +238,10 @@ def calculate_tensor_split(
     speed_string: str,
     reserve_mib: int,
     moe_auto: bool = False,
-    kv_bytes_per_head: int = 0,
+    kv_tokens: int = 0,
+    swa_tokens: int = 0,
+    kv_bytes_per_element: float = 0.0,
+    scratch_bytes: int = 0,
 ) -> int:
     with open(layer_bytes_file, encoding="utf-8") as handle:
         lines = [line.strip() for line in handle if line.strip()]
@@ -196,12 +253,14 @@ def calculate_tensor_split(
         detailed = len(lines) > 1 and len(lines[1].split()) > 1
         if detailed:
             parsed_layers = [tuple(int(value) for value in line.split()) for line in lines[1:]]
-            if any(len(values) not in (2, 3) for values in parsed_layers):
+            if any(len(values) not in (2, 4) for values in parsed_layers):
                 return 1
             base_layer_bytes = [values[0] for values in parsed_layers]
             moe_layer_bytes = [values[1] for values in parsed_layers]
             kv_layer_bytes = [
-                (values[2] if len(values) == 3 else 0) * kv_bytes_per_head
+                int(values[2] * (swa_tokens if values[3] else kv_tokens) * kv_bytes_per_element)
+                if len(values) == 4
+                else 0
                 for values in parsed_layers
             ]
         else:
@@ -222,7 +281,8 @@ def calculate_tensor_split(
 
     def assign_layers(layer_bytes: list[int]) -> list[int] | None:
         reserve_bytes = reserve_mib * 1024 * 1024
-        budget = [max(0, mib * 1024 * 1024 - reserve_bytes) for mib in free_mib]
+        # scratch_bytes は Attention の作業領域 (KV の f16 展開・マスク)。各GPUの compute buffer に載る。
+        budget = [max(0, mib * 1024 * 1024 - reserve_bytes - scratch_bytes) for mib in free_mib]
         fastest = max(range(gpu_count), key=lambda index: speeds[index])
         budget[fastest] -= other_bytes
         if budget[fastest] < 0:
@@ -282,30 +342,40 @@ def main() -> int:
     layer_bytes = commands.add_parser("layer-bytes")
     layer_bytes.add_argument("--exclude-moe", action="store_true")
     layer_bytes.add_argument("--split-moe", action="store_true")
+    layer_bytes.add_argument("--split-ffn", action="store_true")
     commands.add_parser("moe-profile")
+    commands.add_parser("kv-profile")
     tensor_split = commands.add_parser("tensor-split")
     tensor_split.add_argument("layer_bytes_file")
     tensor_split.add_argument("free_mib")
     tensor_split.add_argument("speeds")
     tensor_split.add_argument("reserve_mib", type=int)
     tensor_split.add_argument("--moe-auto", action="store_true")
-    tensor_split.add_argument("--kv-bytes-per-head", type=int, default=0)
+    tensor_split.add_argument("--kv-tokens", type=int, default=0)
+    tensor_split.add_argument("--swa-tokens", type=int, default=0)
+    tensor_split.add_argument("--kv-bytes-per-element", type=float, default=0.0)
+    tensor_split.add_argument("--scratch-bytes", type=int, default=0)
     args = parser.parse_args()
 
     if args.command == "benchmark-speed":
         print(read_benchmark_speed())
         return 0
     if args.command == "layer-bytes":
-        return read_layer_bytes(args.exclude_moe, args.split_moe)
+        return read_layer_bytes(args.exclude_moe, args.split_moe, args.split_ffn)
     if args.command == "moe-profile":
         return read_moe_profile()
+    if args.command == "kv-profile":
+        return read_kv_profile()
     return calculate_tensor_split(
         args.layer_bytes_file,
         args.free_mib,
         args.speeds,
         args.reserve_mib,
         args.moe_auto,
-        args.kv_bytes_per_head,
+        args.kv_tokens,
+        args.swa_tokens,
+        args.kv_bytes_per_element,
+        args.scratch_bytes,
     )
 
 

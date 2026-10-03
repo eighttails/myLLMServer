@@ -76,22 +76,12 @@ detect_context_length() {
     | tr -d '[:space:]'
 }
 
+# "<全長Attention層の1トークンあたりKV要素数> <SWA層の1トークンあたりKV要素数> <sliding_window>" を返す。
+# SSM/Attention ハイブリッドの SSM 層は除外し、SWA 層はウィンドウ分しか確保されないため別枠で返す。
 detect_kv_cache_params() {
   local model_file="$1"
-  gguf-dump --no-tensors --json --json-array "$model_file" 2>/dev/null | jq -r '
-    def scalar_or_max:
-      if type == "array" then (map(select(type == "number")) | max) else . end;
-    (.metadata | to_entries) as $entries
-    | ($entries[] | select(.key | endswith(".block_count")) | .value.value | scalar_or_max) as $block_count
-    | ($entries[] | select(.key | endswith(".attention.head_count_kv")) | .value.value) as $head_count_kv
-    | ($entries[] | select(.key | endswith(".attention.key_length")) | .value.value | scalar_or_max) as $key_length
-    | ($entries[] | select(.key | endswith(".attention.value_length")) | .value.value | scalar_or_max) as $value_length
-    | (if ($head_count_kv | type) == "array"
-       then ($head_count_kv | map(select(type == "number" and . > 0)) | add // 0)
-       else ($block_count * $head_count_kv)
-       end) as $total_kv_heads
-    | "1 \($total_kv_heads) \($key_length) \($value_length)"
-  ' 2>/dev/null | head -n1
+  gguf-dump --no-tensors --json --json-array "$model_file" 2>/dev/null \
+    | /usr/local/bin/model-preset-utils.py kv-profile 2>/dev/null
 }
 
 kv_cache_type_bytes_per_element() {
@@ -105,112 +95,46 @@ kv_cache_type_bytes_per_element() {
   esac
 }
 
-# "<kv-cache-type> <ctx-size>" を返す。モデル本体すら VRAM に収まらない場合は
-# 空文字を返し、呼び出し側で llama-server の --fit に委ねる。
-select_kv_cache_type() {
-  local model_file="$1" ctx_size="$2" free_bytes="$3" model_bytes_override="${4:-}"
-  local params block_count head_count_kv key_length value_length
-  params="$(detect_kv_cache_params "$model_file")"
-  if [[ -z "$params" ]]; then
-    log "Could not detect attention params for $(basename "$model_file"); skipping KV cache type auto-selection"
-    echo ""
-    return
-  fi
-  read -r block_count head_count_kv key_length value_length <<< "$params"
-
-  local model_bytes budget_bytes
-  model_bytes="${model_bytes_override:-$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)}"
-  budget_bytes="$(awk -v f="$free_bytes" -v m="$model_bytes" 'BEGIN { b = (f - m) * 0.9; if (b < 0) b = 0; printf "%.0f", b }')"
-  if ((budget_bytes <= 0)); then
-    log "$(basename "$model_file"): model weights alone exceed free VRAM; falling back to --fit"
-    echo ""
-    return
-  fi
-
-  local candidate bytes_per_elem needed_bytes
-  for candidate in f16 q8_0 q4_0; do
-    bytes_per_elem="$(kv_cache_type_bytes_per_element "$candidate")"
-    needed_bytes="$(awk -v bc="$block_count" -v hkv="$head_count_kv" -v kl="$key_length" -v vl="$value_length" \
-      -v ctx="$ctx_size" -v bpe="$bytes_per_elem" \
-      'BEGIN { printf "%.0f", bc * hkv * (kl + vl) * ctx * bpe }')"
-    if (( $(awk -v n="$needed_bytes" -v b="$budget_bytes" 'BEGIN { print (n <= b) ? 1 : 0 }') )); then
-      log "$(basename "$model_file"): estimated KV cache for $candidate = $((needed_bytes / 1024 / 1024)) MiB (budget $((budget_bytes / 1024 / 1024)) MiB) -> selected"
-      printf '%s %s\n' "$candidate" "$ctx_size"
-      return
-    fi
-    log "$(basename "$model_file"): estimated KV cache for $candidate = $((needed_bytes / 1024 / 1024)) MiB exceeds budget $((budget_bytes / 1024 / 1024)) MiB"
-  done
-
-  # 最も軽い q4_0 でも収まらない場合は、--fit に切り替えるのではなく
-  # 予算に収まるところまで ctx-size を切り詰める。
-  local fitted_ctx
-  bytes_per_elem="$(kv_cache_type_bytes_per_element q4_0)"
-  fitted_ctx="$(awk -v bc="$block_count" -v hkv="$head_count_kv" -v kl="$key_length" -v vl="$value_length" \
-    -v b="$budget_bytes" -v bpe="$bytes_per_elem" -v step="$CONTEXT_SIZE_STEP" \
-    'BEGIN {
-       per_token = bc * hkv * (kl + vl) * bpe
-       if (per_token <= 0) { print 0; exit }
-       ctx = int(b / per_token)
-       ctx = int(ctx / step) * step
-       print ctx
-     }')"
-  if [[ "$fitted_ctx" =~ ^[0-9]+$ ]] && ((fitted_ctx >= MIN_CONTEXT_SIZE)); then
-    log "$(basename "$model_file"): shrinking ctx-size from $ctx_size to $fitted_ctx to fit q4_0 KV cache in VRAM"
-    printf '%s %s\n' q4_0 "$fitted_ctx"
-    return
-  fi
-  log "$(basename "$model_file"): cannot fit q4_0 KV cache even at MIN_CONTEXT_SIZE=$MIN_CONTEXT_SIZE; falling back to --fit"
-  echo ""
+# SWA 層で確保される KV のトークン数。llama-server は SWA 層にウィンドウ×シーケンス数+ubatch 分
+# (ただし全体の ctx-size が上限) しか KV を確保しない。
+swa_cache_tokens() {
+  local params="$1" ctx="$2" slots="$3"
+  local window tokens
+  read -r _ _ window _ <<< "$params"
+  tokens=$(( window * slots + ${UBATCH_SIZE:-256} ))
+  ((tokens > ctx * slots)) && tokens=$((ctx * slots))
+  echo "$tokens"
 }
 
-# 同時実行スロット数を求める。
-# llama-server の KV キャッシュは全スロットで共有されるため、スロット数を増やすと
-# 「個々のリクエストは ctx-size 未満なのに合算で溢れる」状態になりうる。
-# そこで「各スロットが ctx_size を丸ごと確保できる本数」だけを返し、
-# 予算が 1 本分しかなければ 1 (= 逐次実行) に固定する。
-compute_parallel_slots() {
-  local model_file="$1" ctx_size="$2" cache_type="$3" free_bytes="$4" model_bytes="$5"
-  local params block_count head_count_kv key_length value_length
-  local bytes_per_elem budget_bytes slots
-
-  ((MAX_PARALLEL_SLOTS > 1)) || { echo 1; return; }
-  ((free_bytes > 0)) || { echo 1; return; }
-
-  params="$(detect_kv_cache_params "$model_file")"
-  if [[ -z "$params" ]]; then
-    echo 1
-    return
-  fi
-  read -r block_count head_count_kv key_length value_length <<< "$params"
-
-  bytes_per_elem="$(kv_cache_type_bytes_per_element "$cache_type")"
-  budget_bytes="$(awk -v f="$free_bytes" -v m="$model_bytes" 'BEGIN { b = (f - m) * 0.9; if (b < 0) b = 0; printf "%.0f", b }')"
-  slots="$(awk -v bc="$block_count" -v hkv="$head_count_kv" -v kl="$key_length" -v vl="$value_length" \
-    -v ctx="$ctx_size" -v bpe="$bytes_per_elem" -v b="$budget_bytes" -v max="$MAX_PARALLEL_SLOTS" \
-    'BEGIN {
-       per_slot = bc * hkv * (kl + vl) * ctx * bpe
-       if (per_slot <= 0) { print 1; exit }
-       n = int(b / per_slot)
-       if (n < 1) n = 1
-       if (n > max) n = max
-       print n
-     }')"
-  [[ "$slots" =~ ^[0-9]+$ ]] || slots=1
-  echo "$slots"
+# 指定した KV キャッシュ型・1スロットあたりのコンテキスト長・スロット数での KV キャッシュ量 (bytes)。
+kv_cache_bytes() {
+  local params="$1" cache_type="$2" ctx="$3" slots="${4:-1}"
+  local full swa bpe
+  read -r full swa _ <<< "$params"
+  bpe="$(kv_cache_type_bytes_per_element "$cache_type")"
+  awk -v full="$full" -v swa="$swa" -v n=$((ctx * slots)) -v sn="$(swa_cache_tokens "$params" "$ctx" "$slots")" -v bpe="$bpe" \
+    'BEGIN { printf "%.0f", (full * n + swa * sn) * bpe }'
 }
 
-detect_total_free_vram_bytes() {
-  local free_mib_list total_mib=0
-  free_mib_list="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)"
-  if [[ -z "$free_mib_list" ]]; then
-    echo 0
-    return
-  fi
-  while read -r mib; do
-    [[ "$mib" =~ ^[0-9]+$ ]] || continue
-    total_mib=$((total_mib + mib))
-  done <<< "$free_mib_list"
-  echo $((total_mib * 1024 * 1024))
+# GPU 1枚あたりの Attention 作業領域 (bytes) のうち、VRAM_RESERVE_MIB の半分を超える分。
+# 量子化 KV では Flash Attention が層ごとに K/V を f16 へ展開するため「1層の最大要素数 × トークン数 × 2」、
+# さらに KQ マスク (ubatch × トークン数 × 2) が compute buffer に載る。総コンテキストに比例して GB 単位に
+# なり得るため、VRAM_RESERVE_MIB (compute buffer 込みの余白) の半分で吸収しきれない分を KV と合わせて見積もる。
+attn_scratch_bytes() {
+  local params="$1" cache_type="$2" ctx="$3" slots="${4:-1}"
+  local max_full max_swa dequant=1
+  read -r _ _ _ max_full max_swa <<< "$params"
+  [[ "$cache_type" == f16 || "$cache_type" == bf16 || "$cache_type" == f32 ]] && dequant=0
+  awk -v mf="${max_full:-0}" -v ms="${max_swa:-0}" -v n=$((ctx * slots)) -v sn="$(swa_cache_tokens "$params" "$ctx" "$slots")" \
+    -v ub="${UBATCH_SIZE:-256}" -v dq="$dequant" \
+    -v allowance=$((VRAM_RESERVE_MIB * 1024 * 1024 / 2)) \
+    'BEGIN { d = mf * n; if (ms * sn > d) d = ms * sn; x = (dq * d + ub * n) * 2 - allowance; printf "%.0f", (x > 0 ? x : 0) }'
+}
+
+# KV キャッシュ本体と全GPU分の Attention 作業領域を合わせた VRAM 所要量 (bytes)。
+kv_vram_bytes() {
+  local gpus=$((gpu_count > 0 ? gpu_count : 1))
+  echo $(( $(kv_cache_bytes "$@") + gpus * $(attn_scratch_bytes "$@") ))
 }
 
 detect_per_gpu_free_vram_mib() {
@@ -223,6 +147,16 @@ detect_per_gpu_free_vram_mib() {
   else
     nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null
   fi
+}
+
+# GPU ごとに VRAM_RESERVE_MIB (compute buffer 等の余白) を差し引いた空き VRAM の合計 (bytes)。
+detect_usable_vram_bytes() {
+  local total_mib=0 mib
+  while read -r mib; do
+    [[ "$mib" =~ ^[0-9]+$ ]] || continue
+    ((mib > VRAM_RESERVE_MIB)) && total_mib=$((total_mib + mib - VRAM_RESERVE_MIB))
+  done <<< "$(detect_per_gpu_free_vram_mib)"
+  echo $((total_mib * 1024 * 1024))
 }
 
 gpu_count=0
@@ -302,6 +236,8 @@ detect_layer_bytes() {
     args+=(--exclude-moe)
   elif [[ "$mode" == "split" ]]; then
     args+=(--split-moe)
+  elif [[ "$mode" == "split-ffn" ]]; then
+    args+=(--split-moe --split-ffn)
   fi
   gguf-dump --json --json-array "$model_file" 2>/dev/null | /usr/local/bin/model-preset-utils.py "${args[@]}"
 }
@@ -316,27 +252,14 @@ detect_available_ram_bytes() {
 }
 
 calculate_tensor_split() {
-  local layer_bytes_file="$1" free_mib_list="$2" speed_list="$3" reserve_mib="$4" moe_auto="${5:-0}" kv_bytes_per_head="${6:-0}"
+  local layer_bytes_file="$1" free_mib_list="$2" speed_list="$3" reserve_mib="$4" moe_auto="${5:-0}"
+  local kv_tokens="${6:-0}" swa_tokens="${7:-0}" kv_bpe="${8:-0}" scratch_bytes="${9:-0}"
   local args=(tensor-split "$layer_bytes_file" "$free_mib_list" "$speed_list" "$reserve_mib")
   if [[ "$moe_auto" == 1 ]]; then
     args+=(--moe-auto)
   fi
-  args+=(--kv-bytes-per-head "$kv_bytes_per_head")
+  args+=(--kv-tokens "$kv_tokens" --swa-tokens "$swa_tokens" --kv-bytes-per-element "$kv_bpe" --scratch-bytes "$scratch_bytes")
   /usr/local/bin/model-preset-utils.py "${args[@]}"
-}
-
-estimate_kv_cache_mib() {
-  local params="$1" cache_type="$2" ctx_size="$3"
-  if [[ -z "$params" || -z "$cache_type" ]]; then
-    echo 0
-    return
-  fi
-
-  local bc hkv kl vl bpe
-  read -r bc hkv kl vl <<< "$params"
-  bpe="$(kv_cache_type_bytes_per_element "$cache_type")"
-  awk -v bc="$bc" -v hkv="$hkv" -v kl="$kl" -v vl="$vl" -v ctx="$ctx_size" -v bpe="$bpe" \
-    'BEGIN { printf "%.0f", (bc * hkv * (kl + vl) * ctx * bpe) / 1024 / 1024 }'
 }
 
 render_preset() {
@@ -372,7 +295,6 @@ fi
 
 model_n_cpu_moe=""
 model_moe_auto=0
-model_gpu_bytes="$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)"
 moe_profile="$(detect_moe_profile "$model_file" || true)"
 if [[ -n "$moe_profile" ]]; then
   read -r block_count expert_count expert_used_count expert_layer_count expert_bytes <<< "$moe_profile"
@@ -389,8 +311,6 @@ if [[ -n "$moe_profile" ]]; then
     required_ram_bytes=$((expert_bytes + MOE_RAM_RESERVE_MIB * 1024 * 1024))
     if [[ "$available_ram_bytes" =~ ^[0-9]+$ ]] && ((available_ram_bytes >= required_ram_bytes)); then
       model_moe_auto=1
-      model_gpu_bytes=$((model_gpu_bytes - expert_bytes))
-      ((model_gpu_bytes < 0)) && model_gpu_bytes=0
       active_ratio="$(awk -v used="$expert_used_count" -v total="$expert_count" 'BEGIN { printf "%.1f", 100 * used / total }')"
       log "$filename: MoE uses $expert_used_count/$expert_count experts ($active_ratio%); prioritizing KV cache, then keeping as many expert layers in VRAM as fit"
       log "$filename: up to $((expert_bytes / 1024 / 1024)) MiB of expert weights can be moved to CPU for the KV cache"
@@ -400,40 +320,83 @@ if [[ -n "$moe_profile" ]]; then
   fi
 fi
 
-model_kv_cache_type="$KV_CACHE_TYPE"
+# KV キャッシュ型・並列スロット数・重みの配置を次の優先順位で決める。
+#   1. 基本の KV キャッシュ型 (既定 q4_0、KV_CACHE_TYPE 指定時はその型) で、コンテキスト全量の
+#      KV キャッシュを VRAM に載せる。載らない場合のみ ctx-size を切り詰める
+#   2. 残りの VRAM にモデルの重みを載せる。載りきらない分は FFN / Expert の重みを CPU へ退避する
+#   3. さらに余れば、並列スロット分の KV キャッシュを確保する
+#   4. それでも余れば、KV キャッシュ型を f16 / q8_0 へ引き上げる
+if [[ -n "$KV_CACHE_TYPE" ]]; then
+  kv_base_type="$KV_CACHE_TYPE"
+  kv_upgrade_types=()
+else
+  kv_base_type=q4_0
+  kv_upgrade_types=(f16 q8_0)
+fi
+model_kv_cache_type="$kv_base_type"
+model_parallel=1
 model_fit_fallback=0
-total_free_vram_bytes="$(detect_total_free_vram_bytes)"
-if [[ -z "$model_kv_cache_type" ]]; then
-  if ((total_free_vram_bytes > 0)); then
-    kv_selection="$(select_kv_cache_type "$model_file" "$model_ctx_size" "$total_free_vram_bytes" "$model_gpu_bytes")"
-    if [[ -n "$kv_selection" ]]; then
-      read -r model_kv_cache_type fitted_ctx_size <<< "$kv_selection"
-      if [[ "$fitted_ctx_size" =~ ^[0-9]+$ ]] && ((fitted_ctx_size != model_ctx_size)); then
-        log "Adjusted ctx-size for $filename: $model_ctx_size -> $fitted_ctx_size"
-        model_ctx_size="$fitted_ctx_size"
+model_file_bytes="$(stat -c '%s' "$model_file" 2>/dev/null || echo 0)"
+kv_params="$(detect_kv_cache_params "$model_file")"
+usable_vram_bytes="$(detect_usable_vram_bytes)"
+if [[ -z "$kv_params" ]]; then
+  log "Could not detect attention params for $filename; relying on llama-server's --fit auto-adjustment"
+  model_fit_fallback=1
+elif ((usable_vram_bytes <= 0)); then
+  log "Could not detect free VRAM for $filename; relying on llama-server's --fit auto-adjustment"
+  model_fit_fallback=1
+else
+  kv_one_slot_bytes="$(kv_vram_bytes "$kv_params" "$kv_base_type" "$model_ctx_size")"
+  if ((kv_one_slot_bytes > usable_vram_bytes)); then
+    # KV 所要量は ctx にほぼ比例するが SWA 分が非線形のため、CONTEXT_SIZE_STEP 単位で二分探索する
+    lo=0 hi=$((model_ctx_size / CONTEXT_SIZE_STEP))
+    while ((lo < hi)); do
+      mid=$(((lo + hi + 1) / 2))
+      if (($(kv_vram_bytes "$kv_params" "$kv_base_type" $((mid * CONTEXT_SIZE_STEP))) <= usable_vram_bytes)); then
+        lo=$mid
+      else
+        hi=$((mid - 1))
       fi
-      log "Auto-selected KV cache type for $filename: $model_kv_cache_type"
+    done
+    fitted_ctx=$((lo * CONTEXT_SIZE_STEP))
+    if ((fitted_ctx >= MIN_CONTEXT_SIZE)); then
+      log "$filename: $kv_base_type KV cache for ctx-size=$model_ctx_size ($((kv_one_slot_bytes / 1024 / 1024)) MiB) exceeds usable VRAM ($((usable_vram_bytes / 1024 / 1024)) MiB); shrinking ctx-size to $fitted_ctx"
+      model_ctx_size="$fitted_ctx"
+      kv_one_slot_bytes="$(kv_vram_bytes "$kv_params" "$kv_base_type" "$model_ctx_size")"
     else
+      log "$filename: cannot fit $kv_base_type KV cache even at MIN_CONTEXT_SIZE=$MIN_CONTEXT_SIZE; relying on llama-server's --fit auto-adjustment"
       model_fit_fallback=1
     fi
-  else
-    log "Could not detect free VRAM; leaving KV cache type at llama-server default (f16) for $filename"
+  fi
+
+  if ((model_fit_fallback == 0)); then
+    remaining_bytes=$((usable_vram_bytes - kv_one_slot_bytes))
+    if ((model_file_bytes <= remaining_bytes)); then
+      if ((MAX_PARALLEL_SLOTS > 1 && kv_one_slot_bytes > 0)); then
+        model_parallel=$((1 + (remaining_bytes - model_file_bytes) / kv_one_slot_bytes))
+        ((model_parallel > MAX_PARALLEL_SLOTS)) && model_parallel="$MAX_PARALLEL_SLOTS"
+      fi
+      for candidate in "${kv_upgrade_types[@]}"; do
+        candidate_bytes="$(kv_vram_bytes "$kv_params" "$candidate" "$model_ctx_size" "$model_parallel")"
+        if ((model_file_bytes + candidate_bytes <= usable_vram_bytes)); then
+          model_kv_cache_type="$candidate"
+          break
+        fi
+      done
+    else
+      log "$filename: model weights ($((model_file_bytes / 1024 / 1024)) MiB) do not fit next to the $kv_base_type KV cache ($((kv_one_slot_bytes / 1024 / 1024)) MiB) in usable VRAM ($((usable_vram_bytes / 1024 / 1024)) MiB); part of the weights will be kept on CPU"
+    fi
+    log "Estimated plan for $filename: ctx-size=$model_ctx_size, KV cache=$model_kv_cache_type, slots=$model_parallel"
   fi
 fi
 
-# 同時実行スロット数は「各スロットがコンテキスト全量を確保できる」場合にのみ増やす。
-# 以降の VRAM 計算は KV プール全体 (= スロット数 × 1スロット分) を対象にする必要があるため、
-# ここで model_ctx_size を合計値へ引き上げ、1 リクエストあたりの上限は
-# model_ctx_per_slot として保持する。
 model_ctx_per_slot="$model_ctx_size"
-model_parallel="$(compute_parallel_slots "$model_file" "$model_ctx_per_slot" \
-  "${model_kv_cache_type:-${KV_CACHE_TYPE:-f16}}" "$total_free_vram_bytes" "$model_gpu_bytes")"
-model_ctx_size=$((model_ctx_per_slot * model_parallel))
-
 model_tensor_split=""
 model_n_gpu_layers_fixed=""
+model_offload_kind=""
 if [[ "$model_fit_fallback" == 1 ]]; then
-  log "Model weights do not fit in free VRAM for $filename; relying on llama-server's --fit auto-adjustment"
+  model_parallel=1
+  model_kv_cache_type="$kv_base_type"
 elif [[ "$SPLIT_MODE" != "layer" ]]; then
   # 手動 tensor-split/n-gpu-layers 計算は「レイヤーを丸ごと1枚のGPUに割り当てる」前提の
   # ロジックのため、row/tensor/none 分割では成立しない。--fit に委ねる。
@@ -443,85 +406,100 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
   if [[ -n "$gpu_tg_speeds" ]]; then
     log "Per-GPU generation speed (tok/s): $(tr '\n' ' ' <<< "$gpu_tg_speeds")"
     layer_bytes_file="$(mktemp)"
-    layer_bytes_mode="split"
+    # CPU へ退避できる重み: MoE は Expert (--n-cpu-moe)、Dense は FFN (--n-cpu-ffn)。
+    # いずれも Attention と KV キャッシュは GPU に残るため、KV 優先の方針を維持できる。
+    offload_allowed=0
+    if [[ -n "${expert_bytes:-}" ]] && ((expert_bytes > 0)); then
+      layer_bytes_mode="split"
+      if ((model_moe_auto == 1)); then
+        offload_allowed=1
+        model_offload_kind="moe"
+      fi
+    else
+      layer_bytes_mode="split-ffn"
+    fi
     if detect_layer_bytes "$model_file" "$layer_bytes_mode" > "$layer_bytes_file" && [[ -s "$layer_bytes_file" ]]; then
-      free_mib_list="$(detect_per_gpu_free_vram_mib)"
-      params="$(detect_kv_cache_params "$model_file")"
-      kv_total_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$model_ctx_size")"
-      read -r _ total_kv_heads kl vl <<< "$params"
-      bpe="$(kv_cache_type_bytes_per_element "$model_kv_cache_type")"
-      kv_bytes_per_head="$(awk -v kl="$kl" -v vl="$vl" -v ctx="$model_ctx_size" -v bpe="$bpe" \
-        'BEGIN { printf "%.0f", (kl + vl) * ctx * bpe }')"
-      reserve_mib="$VRAM_RESERVE_MIB"
-      result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$reserve_mib" "$model_moe_auto" "$kv_bytes_per_head" || true)"
-      if [[ -z "$result" ]]; then
-        # KV 選択時の概算では収まっても、GPU ごとの重み配置と固定予約を加えると
-        # tensor-split が成立しないことがある。重みだけが収まるなら --fit へ逃げず、
-        # 手動配置が成立する最大のコンテキスト長を探索する。
-        model_only_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" "$model_moe_auto" 0 || true)"
-        if [[ -n "$model_only_result" ]]; then
-          min_step=$(( (MIN_CONTEXT_SIZE + CONTEXT_SIZE_STEP - 1) / CONTEXT_SIZE_STEP ))
-          max_step=$(( model_ctx_size / CONTEXT_SIZE_STEP ))
-          best_ctx=0
-          best_result=""
-
-          if ((min_step <= max_step)); then
-            min_ctx=$((min_step * CONTEXT_SIZE_STEP))
-            min_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$min_ctx")"
-            min_kv_bytes_per_head="$(awk -v kl="$kl" -v vl="$vl" -v ctx="$min_ctx" -v bpe="$bpe" \
-              'BEGIN { printf "%.0f", (kl + vl) * ctx * bpe }')"
-            min_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" "$model_moe_auto" "$min_kv_bytes_per_head" || true)"
-            if [[ -n "$min_result" ]]; then
-              low_step="$min_step"
-              high_step="$max_step"
-              while ((low_step <= high_step)); do
-                mid_step=$(( (low_step + high_step) / 2 ))
-                trial_ctx=$((mid_step * CONTEXT_SIZE_STEP))
-                trial_kv_mib="$(estimate_kv_cache_mib "$params" "$model_kv_cache_type" "$trial_ctx")"
-                trial_kv_bytes_per_head="$(awk -v kl="$kl" -v vl="$vl" -v ctx="$trial_ctx" -v bpe="$bpe" \
-                  'BEGIN { printf "%.0f", (kl + vl) * ctx * bpe }')"
-                trial_result="$(calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" "$model_moe_auto" "$trial_kv_bytes_per_head" || true)"
-                if [[ -n "$trial_result" ]]; then
-                  best_ctx="$trial_ctx"
-                  best_result="$trial_result"
-                  low_step=$((mid_step + 1))
-                else
-                  high_step=$((mid_step - 1))
-                fi
-              done
-            fi
-          fi
-
-          min_ctx_percent="${TENSOR_SPLIT_MIN_CTX_PERCENT:-75}"
-          min_acceptable_ctx=$(( model_ctx_size * min_ctx_percent / 100 ))
-          if [[ -n "$best_result" ]] && ((best_ctx < min_acceptable_ctx)); then
-            # 全層 GPU 配置のためにコンテキストを大幅に削るより、一部の層を CPU へ
-            # 退避してでもコンテキスト長を維持する方を優先し、--fit に委ねる。
-            log "Manual tensor-split would shrink ctx-size for $filename from $model_ctx_size to $best_ctx (< ${min_ctx_percent}%); keeping ctx-size and falling back to --fit"
-            best_result=""
-            result=""
-          elif [[ -n "$best_result" ]]; then
-            log "Shrinking ctx-size for $filename from $model_ctx_size to $best_ctx to enable manual tensor-split"
-            model_ctx_size="$best_ctx"
-            result="$best_result"
-          else
-            log "Manual tensor-split cannot fit at MIN_CONTEXT_SIZE=$MIN_CONTEXT_SIZE; falling back to --fit"
-          fi
-        else
-          log "Model weights cannot fit with the per-GPU reserve; falling back to --fit"
+      if [[ "$layer_bytes_mode" == "split-ffn" ]]; then
+        ffn_bytes="$(awk 'NR > 1 { sum += $2 } END { printf "%.0f", sum }' "$layer_bytes_file")"
+        available_ram_bytes="$(detect_available_ram_bytes)"
+        if ((ffn_bytes > 0)) && [[ "$available_ram_bytes" =~ ^[0-9]+$ ]] \
+            && ((available_ram_bytes >= ffn_bytes + MOE_RAM_RESERVE_MIB * 1024 * 1024)); then
+          offload_allowed=1
+          model_offload_kind="ffn"
         fi
       fi
-      if [[ -n "$result" ]]; then
-        read -r model_n_gpu_layers_fixed model_tensor_split model_n_cpu_moe cpu_moe_bytes <<< "$result"
-        if ((model_moe_auto == 1)); then
-          model_n_cpu_moe="${model_n_cpu_moe:-0}"
-          cpu_moe_bytes="${cpu_moe_bytes:-0}"
-          gpu_moe_bytes=$((expert_bytes - cpu_moe_bytes))
-          log "$filename: keeping $((gpu_moe_bytes / 1024 / 1024)) MiB of expert weights in VRAM; offloading $((cpu_moe_bytes / 1024 / 1024)) MiB from the first $model_n_cpu_moe layers"
+      free_mib_list="$(detect_per_gpu_free_vram_mib)"
+      try_split() {
+        local cache_type="$1" slots="$2" ctx="${3:-$model_ctx_per_slot}"
+        calculate_tensor_split "$layer_bytes_file" "$free_mib_list" "$gpu_tg_speeds" "$VRAM_RESERVE_MIB" \
+          "$offload_allowed" $((ctx * slots)) "$(swa_cache_tokens "$kv_params" "$ctx" "$slots")" \
+          "$(kv_cache_type_bytes_per_element "$cache_type")" "$(attn_scratch_bytes "$kv_params" "$cache_type" "$ctx" "$slots")" || true
+      }
+      offloaded_layers() {
+        local n
+        read -r _ _ n _ <<< "$1"
+        echo "${n:-0}"
+      }
+
+      # 1〜2: 基本型の KV キャッシュを 1 スロット分確保したうえで、CPU へ退避する層数が最小になる配置
+      result="$(try_split "$kv_base_type" 1)"
+      if [[ -z "$result" ]] && ((offload_allowed == 1)); then
+        # FFN / Expert をすべて CPU へ退避しても、KV キャッシュと GPU に残す重み (Attention 等) が
+        # 収まらない。--fit に任せると層ごと CPU へ移り KV キャッシュも CPU 側に置かれるため、
+        # KV キャッシュを VRAM に載せきれる最大の ctx-size まで切り詰める。
+        low_step=$(( (MIN_CONTEXT_SIZE + CONTEXT_SIZE_STEP - 1) / CONTEXT_SIZE_STEP ))
+        high_step=$(( model_ctx_per_slot / CONTEXT_SIZE_STEP ))
+        best_ctx=0
+        while ((low_step <= high_step)); do
+          mid_step=$(( (low_step + high_step) / 2 ))
+          trial="$(try_split "$kv_base_type" 1 $((mid_step * CONTEXT_SIZE_STEP)))"
+          if [[ -n "$trial" ]]; then
+            best_ctx=$((mid_step * CONTEXT_SIZE_STEP))
+            result="$trial"
+            low_step=$((mid_step + 1))
+          else
+            high_step=$((mid_step - 1))
+          fi
+        done
+        if ((best_ctx > 0)); then
+          log "$filename: $kv_base_type KV cache for ctx-size=$model_ctx_per_slot does not fit in VRAM next to the non-offloadable weights; shrinking ctx-size to $best_ctx"
+          model_ctx_per_slot="$best_ctx"
+        fi
+      fi
+      if [[ -z "$result" ]]; then
+        log "Could not fit $kv_base_type KV cache for ctx-size=$model_ctx_per_slot with a manual tensor-split for $filename; relying on llama-server's --fit auto-adjustment"
+        model_parallel=1
+        model_kv_cache_type="$kv_base_type"
+      else
+        min_offload="$(offloaded_layers "$result")"
+        # 3: 退避層数を増やさずに確保できる最大スロット数
+        model_parallel=1
+        for ((slots = MAX_PARALLEL_SLOTS; slots > 1; slots--)); do
+          trial="$(try_split "$kv_base_type" "$slots")"
+          if [[ -n "$trial" ]] && (($(offloaded_layers "$trial") == min_offload)); then
+            model_parallel="$slots"
+            result="$trial"
+            break
+          fi
+        done
+        # 4: 退避層数・スロット数を維持できる範囲で KV キャッシュ型を引き上げる
+        model_kv_cache_type="$kv_base_type"
+        for candidate in "${kv_upgrade_types[@]}"; do
+          trial="$(try_split "$candidate" "$model_parallel")"
+          if [[ -n "$trial" ]] && (($(offloaded_layers "$trial") == min_offload)); then
+            model_kv_cache_type="$candidate"
+            result="$trial"
+            break
+          fi
+        done
+
+        read -r model_n_gpu_layers_fixed model_tensor_split model_n_cpu_moe cpu_offload_bytes <<< "$result"
+        model_n_cpu_moe="${model_n_cpu_moe:-0}"
+        cpu_offload_bytes="${cpu_offload_bytes:-0}"
+        if ((model_n_cpu_moe > 0)); then
+          log "$filename: keeping $model_offload_kind weights of the first $model_n_cpu_moe layers ($((cpu_offload_bytes / 1024 / 1024)) MiB) on CPU to keep the KV cache in VRAM"
         fi
         log "Calculated tensor-split for $filename: n-gpu-layers=$model_n_gpu_layers_fixed tensor-split=$model_tensor_split"
-      else
-        log "Could not fit a manual tensor-split for $filename within free VRAM"
       fi
     else
       log "Could not determine per-layer tensor sizes for $filename; falling back to --fit"
@@ -533,18 +511,11 @@ elif [[ "$TENSOR_SPLIT_MODE" == "auto" && "$gpu_count" -ge 2 ]]; then
 else
   log "TENSOR_SPLIT_MODE=$TENSOR_SPLIT_MODE or single GPU; relying on llama-server's --fit auto-adjustment"
 fi
+model_ctx_size=$((model_ctx_per_slot * model_parallel))
+log "Auto-selected KV cache type for $filename: $model_kv_cache_type"
 
 section_file="$PRESET_SECTION_DIR/$alias_name.ini"
 tmp_section="$(mktemp "$section_file.tmp.XXXXXX")"
-# 手動 tensor-split の探索などで KV プール全体が切り詰められた場合は、
-# 「各スロットにコンテキスト全量」を維持できる本数までスロット数を下げ直す。
-if ((model_ctx_size < model_ctx_per_slot)); then
-  model_parallel=1
-  model_ctx_per_slot="$model_ctx_size"
-else
-  model_parallel=$((model_ctx_size / model_ctx_per_slot))
-  model_ctx_size=$((model_ctx_per_slot * model_parallel))
-fi
 if ((model_parallel > 1)); then
   log "Allocating $model_parallel parallel slots for $filename (per-slot ctx-size=$model_ctx_per_slot, total ctx-size=$model_ctx_size)"
 else
@@ -568,7 +539,11 @@ fi
     printf 'n-gpu-layers = %s\n' "$N_GPU_LAYERS"
   fi
   if [[ -n "$model_n_cpu_moe" ]] && ((model_n_cpu_moe > 0)); then
-    printf 'n-cpu-moe = %s\n' "$model_n_cpu_moe"
+    if [[ "$model_offload_kind" == "ffn" ]]; then
+      printf 'n-cpu-ffn = %s\n' "$model_n_cpu_moe"
+    else
+      printf 'n-cpu-moe = %s\n' "$model_n_cpu_moe"
+    fi
   fi
   kv_type="${model_kv_cache_type:-${KV_CACHE_TYPE:-f16}}"
   printf 'cache-type-k = %s\n' "$kv_type"

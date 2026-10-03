@@ -181,7 +181,6 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `MAX_CONTEXT_SIZE`                                                      | (未設定=上限なし)        | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `MIN_CONTEXT_SIZE`                                                      | `2048`                   | KV キャッシュが VRAM に収まらず自動でコンテキスト長を切り詰める際の下限。これを下回る場合のみ `--fit` にフォールバックする                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `CONTEXT_SIZE_STEP`                                                     | `1024`                   | コンテキスト長を自動で切り詰める際の丸め単位                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `TENSOR_SPLIT_MIN_CTX_PERCENT`                                          | `75`                     | 手動`tensor-split`(全層GPU配置)を成立させるために`ctx-size`をこの割合(%)未満まで縮める必要がある場合は、縮めずに`--fit`(一部の層をCPUへ退避)へフォールバックしてコンテキスト長を優先する。`0`で常に手動`tensor-split`を優先                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `N_GPU_LAYERS`                                                          | `auto`                   | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `MODELS_MAX`                                                            | `1`                      | 同時にロードしておくモデル数の上限(router mode)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `MAX_PARALLEL_SLOTS`                                                    | `4`                      | 1 モデルあたりの同時実行スロット数の**上限**。llama-server の KV キャッシュは全スロットで共有されるため、実際のスロット数は「各スロットがコンテキスト長を丸ごと確保できる本数」まで VRAM 見積もりから自動で切り下げられる(1 本分しか確保できなければ 1 = 逐次実行)。`1` を指定すると常に逐次実行になる                                                                                                                                                                                                                                                                                       |
@@ -191,8 +190,8 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `VRAM_RESERVE_MIB`                                                      | `4096`                   | `--fit`と手動`tensor-split`計算でGPUごとに確保する、compute bufferとCUDAワークスペースを含むランタイム用のVRAM余白(MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `MOE_CPU_OFFLOAD`                                                       | `auto`                   | MoE expert重みのCPU配置。`auto`はアクティブexpert比率が閾値以下の場合、KV確保後に収まらないexpert層だけCPUへ配置。`all`はすべてのMoEモデルで同じ調整を有効化、`off`は無効化                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `MOE_ACTIVE_RATIO_THRESHOLD`                                            | `0.125`                  | `MOE_CPU_OFFLOAD=auto`でCPU配置を有効にする`expert_used_count / expert_count`の上限                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `MOE_RAM_RESERVE_MIB`                                                   | `8192`                   | MoE expert重みをCPUへ配置した後も残すホストRAMの余白(MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `KV_CACHE_TYPE`                                                         | (未設定=自動選択)        | KVキャッシュの量子化タイプを固定したい場合に指定。KとVは常に同じ型(`cache-type-k` == `cache-type-v`)になるように保証されます。未指定時はモデル切替時に空き VRAM と対象モデルの GGUF メタデータから必要な KV キャッシュ量を見積もり、収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択する。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`                                                                                                                                                                                                       |
+| `MOE_RAM_RESERVE_MIB`                                                   | `8192`                   | MoE expert重み / Dense FFN重みをCPUへ配置した後も残すホストRAMの余白(MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `KV_CACHE_TYPE`                                                         | (未設定=自動選択)        | KVキャッシュの量子化タイプを固定したい場合に指定。KとVは常に同じ型(`cache-type-k` == `cache-type-v`)になるように保証されます。未指定時は `q4_0` を基本とし、重みと並列スロット分を確保してもVRAMが余る場合のみ `f16` → `q8_0` の順に引き上げる(詳細は「KV キャッシュ・重み・並列数の優先順位」を参照)。指定時はその型に固定され、引き上げは行わない。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`                                                                                                                                                                                                       |
 | `TENSOR_SPLIT_MODE`                                                     | `auto`                   | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる。`SPLIT_MODE` が `layer` 以外の場合はこの計算自体を行わない                                                                                                                                                                                                                                                       |
 | `SPLIT_MODE`                                                            | `layer`                  | llama-server の `--split-mode`。複数 GPU 間でのモデル分割方式。`layer`(既定): レイヤー単位でGPUに分割するパイプライン並列。1トークン生成中は常にどれか1枚のGPUのみが計算するため、GPU使用率は50%前後(2GPU時)に留まりやすい仕様。`row`: 各レイヤーの重みを行単位でGPU間に分割するテンソル並列で、全GPUが同時に計算に参加できる。`tensor`: 重みとKVキャッシュの両方を分割(実験的)。`none`: 単一GPUのみ使用。**注意**: `row`/`tensor` は毎レイヤーGPU間の同期が発生するため、NVLink等の高速な相互接続が無い環境(PCIe経由のみ)や性能の異なるGPUの組み合わせでは、`layer` より遅くなることがある |
 | `THINKING_MODE`                                                         | `auto`                   | Qwen3.6-35B-A3B-UD 等の思考型モデルにおける推論プロセスの出力制御。`on`: thinking モードを有効化 (推論プロセスの出力を許可)。`off`: thinking モードを無効化 (推論プロセスの出力を抑制)。`auto` (デフォルト): リクエストに thinking パラメータがあればそれを使用、なければ有効。Ollama 互換・OpenAI 互換の両 API で動作し、リクエスト/レスポンス両方から `reasoning_content`, `thinking_content`, `reasoning`, `thoughts` 等のフィールドを自動で除去します。 |
@@ -220,8 +219,8 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
   丸ごと確保できる本数(= 空きVRAM ÷ 1スロット分のKVキャッシュ量)だけをスロットとして開き、`ctx-size`には
   その合計値、`kv-unified-per-slot`には1リクエストあたりの上限を指定します。1本分しか確保できない場合は
   1スロット(逐次実行)となり、1リクエストがコンテキスト全量を使えることが保証されます。上限は
-  `MAX_PARALLEL_SLOTS`で調整できます。手動`tensor-split`の探索でKVプール全体が切り詰められた場合は、
-  コンテキスト全量を維持できる本数までスロット数を下げ直します。
+  `MAX_PARALLEL_SLOTS`で調整できます。並列スロットの確保は、モデルの重みがVRAMに載った後の余りで行われます
+  (後述の優先順位を参照)。
 - **低アクティブ率MoEの自動CPU配置**: GGUFの`expert_count`と`expert_used_count`を調べ、既定では
   1トークンあたりのアクティブexpert比率が12.5%以下なら、まず全expertをCPUへ置ける前提でKVキャッシュを確保します。
   その後`n-cpu-moe`を0から順に試し、KVキャッシュとVRAM余白を維持したまま成立する最小値を採用します。
@@ -248,19 +247,29 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
   常に `--fit` 任せになります。
 - **コンテキスト長の自動検出**: `CONTEXT_SIZE` を指定しない場合、モデル切替時に `gguf-dump` を使って対象モデルの GGUF メタデータから
   `<arch>.context_length`(モデルが学習時にサポートする最大コンテキスト長)を読み取り、`ctx-size` に設定します。
-- **KV キャッシュ量子化の自動選択**: `KV_CACHE_TYPE` を指定しない場合、モデル切替時に `nvidia-smi` で取得した空き VRAM 合計から
-  モデルファイルサイズを差し引いた「予算」を計算し、モデルの GGUF メタデータ(`block_count` /
-  `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から算出した必要 KV キャッシュ量と
-  比較して、予算に収まる範囲でなるべく精度の高いタイプ(`f16` → `q8_0` → `q4_0` の順)を自動選択します。
+- **KV キャッシュ・重み・並列数の優先順位**: モデル切替時に、GGUF メタデータ(`block_count` /
+  `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から必要 KV キャッシュ量を求め、
+  GPU ごとの空き VRAM から `VRAM_RESERVE_MIB` を差し引いた量を予算として、次の優先順位で割り当てます。
   `head_count_kv`が層ごとの配列であるSSM/Attentionハイブリッドモデルでは、値が0のSSM層をKV計算から除外します。
-- **コンテキスト長の自動切り詰め**: 最も軽い `q4_0` でも KV キャッシュが予算に収まらない場合は、`--fit` に
-  切り替えるのではなく `q4_0` のまま予算に収まるところまで `ctx-size` を切り詰めます(`CONTEXT_SIZE_STEP`
-  の倍数に丸め、`MIN_CONTEXT_SIZE` を下限とします)。KV キャッシュの概算では収まっていても、GPU ごとの
-  重み配置と固定予約を含めると `tensor-split` が成立しない場合も、成立する最大のコンテキスト長を探索します。
-  ただし、その結果が元のコンテキスト長の `TENSOR_SPLIT_MIN_CTX_PERCENT`(既定 75%)未満になる場合は、
-  コンテキスト長を維持したまま `--fit` にフォールバックし、一部の層を CPU へ退避します(生成速度は低下します)。
-  モデルの重み自体が空き VRAM に収まらない場合のみ、KV キャッシュ・`tensor-split` の手動指定を諦めて
-  `--fit` 任せにフォールバックします。
+  `full_attention_interval` を持つハイブリッドモデルは全長 Attention 層のみを、Sliding Window Attention(SWA)を
+  使うモデル(Gemma 等)は SWA 層をウィンドウ分(`sliding_window` × スロット数 + `UBATCH_SIZE`)のみとして計算します。
+  また量子化 KV では Flash Attention が K/V を f16 へ展開する作業領域(1層分 × 総トークン数)と KQ マスクが
+  compute buffer に載るため、これが `VRAM_RESERVE_MIB` の半分を超える分も KV の所要量として加算します。
+  1. **KV キャッシュ(`q4_0`)をコンテキスト全量で VRAM に載せる**: `KV_CACHE_TYPE` 未指定時は `q4_0` を基本とします
+     (指定時はその型)。予算に収まらない場合のみ `ctx-size` を切り詰めます(`CONTEXT_SIZE_STEP` の倍数に丸め、
+     `MIN_CONTEXT_SIZE` を下限とします)。
+  2. **モデルの重みを VRAM に載せる**: 載りきらない場合は、Attention 層と KV キャッシュを GPU に残したまま、
+     先頭側の層の FFN 重み(Dense モデルは `n-cpu-ffn`、MoE モデルは後述の `n-cpu-moe`)だけを CPU へ退避します。
+     コンテキスト長は削りません(生成速度は低下します)。
+  3. **並列スロット分の KV キャッシュを確保する**: 重みを載せた後の余りで、CPU へ退避する層を増やさずに
+     確保できる本数だけスロットを開きます(上限 `MAX_PARALLEL_SLOTS`)。
+  4. **KV キャッシュ型の引き上げ**: それでも余る場合のみ、`f16` → `q8_0` の順に収まる最も精度の高い型へ引き上げます
+     (`KV_CACHE_TYPE` 指定時は引き上げません)。
+
+  複数 GPU で `TENSOR_SPLIT_MODE=auto` の場合は、上記を GPU ごとの層配置(`tensor-split`)まで含めて検証します。
+  単一 GPU・`TENSOR_SPLIT_MODE=off`・`SPLIT_MODE` が `layer` 以外の場合は見積もりのみで決定し、重みが載りきらない
+  場合の配置は `--fit` に委ねます(この場合、CPU へ退避された層の KV キャッシュは CPU 側に置かれます)。
+  KV キャッシュを基本型でも 1 スロット分すら確保できない場合も `--fit` 任せにフォールバックします。
 
 ## Continue (VS Code拡張) との連携
 
@@ -288,8 +297,8 @@ models:
 
 - `docker logs my-llm-server` で `cudaMalloc failed: out of memory` が出ていないか確認してください。
 - 通常は KV キャッシュ量子化が空き VRAM から自動選択されるため発生しにくいですが、他プロセスが GPU を
-  使用中で空き VRAM が少ない場合などはそれでも収まらないことがあります。その場合は `KV_CACHE_TYPE=q4_0`
-  を明示指定するか、`MAX_CONTEXT_SIZE` でコンテキスト長自体を制限してください。
+  使用中で空き VRAM が少ない場合などはそれでも収まらないことがあります。その場合は `VRAM_RESERVE_MIB` を
+  増やすか、`MAX_CONTEXT_SIZE` でコンテキスト長自体を制限してください。
 
 ### リクエストが `context size exceeded` 的なエラーになる
 
