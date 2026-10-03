@@ -24,11 +24,12 @@ Docker コンテナ上で動かすためのラッパーです。
 .
 ├── docker/
 │   ├── Dockerfile        # llama.cpp:full-cuda ベースイメージ + ラッパースクリプト
-│   ├── start-llama.sh    # コンテナ ENTRYPOINT。モデル同期・軽量preset生成・llama-server/proxy起動を行う
-│   ├── sync-model.sh     # model_list.yml の読み込み、モデル自動ダウンロード・不要モデル削除を行う
-│   ├── configure-model-preset.sh # モデル切替時に重い preset 計算を行う
+│   ├── start-llama.py    # コンテナ内のモデル同期・llama-server/proxy起動を制御
+│   ├── sync-model.py     # model_list.yml の読み込み、モデル自動ダウンロード・不要モデル削除を行う
+│   ├── configure-model-preset.py # モデル切替時に重い preset 計算を行う
 │   ├── lazy-llama-proxy.py       # 公開ポートで受け、モデル切替時だけ preset を更新する
-│   └── unload-model.sh           # コンテナ内からモデルをアンロードするスクリプト
+│   ├── unload-model.py           # コンテナ内からモデルをアンロードする
+│   └── *.sh                     # 既存パス互換の Python 起動ラッパー
 ├── launch-container.sh    # ホスト側から使う起動スクリプト(ビルド + コンテナ再作成)
 ├── unload-model.sh        # 外部(ホスト側)からモデルをアンロードするスクリプト
 ├── reload-model.sh        # model_list.yml を再ロードし、モデル・補助ファイルの追加ダウンロード＆不要ファイル削除を行うスクリプト
@@ -108,6 +109,7 @@ models:
 ```
 
 編集後、コンテナを再起動せずに `model_list.yml` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
+このコマンドは起動中のコンテナを前提とし、モデルリストを共有ディレクトリへ反映した後、コンテナ内のPython同期処理を実行します。
 
 ```bash
 ./reload-model.sh

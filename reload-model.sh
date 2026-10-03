@@ -7,62 +7,18 @@ MODEL_DIR="${MODEL_DIR:-$SCRIPT_DIR/models}"
 MODEL_LIST_FILE="${MODEL_LIST_FILE:-$SCRIPT_DIR/model_list.yml}"
 MODEL_LIST_EXAMPLE="${MODEL_LIST_EXAMPLE:-$SCRIPT_DIR/model_list.example.yml}"
 
-log() { printf '%s\n' "$*" >&2; }
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-
-cleanup_unused_models() {
-  local model_spec repo filename cached_file
-  declare -A allowed_files=()
-  while IFS=$'\t' read -r main_url mtp_url mmproj_url imatrix_url; do
-    for model_url in "$main_url" "$mtp_url" "$mmproj_url" "$imatrix_url"; do
-      [[ -n "$model_url" ]] || continue
-      filename="${model_url##*/}"; filename="${filename%%\?*}"
-      allowed_files["$filename"]=1
-    done
-  done < <(python3 "$SCRIPT_DIR/docker/model-list-utils.py" "$MODEL_LIST_FILE")
-
-  ((${#allowed_files[@]} > 0)) || die "no valid model entries found in $MODEL_LIST_FILE"
-
-  shopt -s nullglob
-  for cached_file in "$MODEL_DIR"/*.gguf "$MODEL_DIR"/*.bin "$MODEL_DIR"/*.dat; do
-    filename="$(basename "$cached_file")"
-    if [[ -z "${allowed_files[$filename]+x}" ]]; then
-      log "Removing model not in model_list: $cached_file"
-      rm -f -- "$cached_file"
-      rm -f -- "$cached_file.part"
-      rm -f -- "$MODEL_DIR/llama-bench-$filename.json"
-    fi
-  done
-  shopt -u nullglob
-}
-
-# model_list.yml がなければサンプルからコピーする
 if [[ ! -f "$MODEL_LIST_FILE" ]]; then
-  log "model list file not found: $MODEL_LIST_FILE"
-  if [[ -f "$MODEL_LIST_EXAMPLE" ]]; then
-    log "copying from example: $MODEL_LIST_EXAMPLE"
-    cp "$MODEL_LIST_EXAMPLE" "$MODEL_LIST_FILE"
-  else
-    die "example model list file not found: $MODEL_LIST_EXAMPLE"
+  if [[ ! -f "$MODEL_LIST_EXAMPLE" ]]; then
+    echo "error: model list file and example are both missing" >&2
+    exit 1
   fi
+  echo "model list file not found: $MODEL_LIST_FILE" >&2
+  echo "copying from example: $MODEL_LIST_EXAMPLE" >&2
+  cp "$MODEL_LIST_EXAMPLE" "$MODEL_LIST_FILE"
 fi
 
 mkdir -p "$MODEL_DIR"
 cp "$MODEL_LIST_FILE" "$MODEL_DIR/model_list.yml"
-cleanup_unused_models
 
-# コンテナが起動中であれば、コンテナ内で sync-model.sh を実行する
-if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1 && \
-   [[ "$(docker container inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == "true" ]]; then
-  echo "Reloading model_list and syncing models in container '$CONTAINER_NAME'..."
-  if ! docker exec "$CONTAINER_NAME" test -f /usr/local/bin/sync-model.sh 2>/dev/null; then
-    echo "Installing sync-model.sh into running container..."
-    docker cp "$SCRIPT_DIR/docker/sync-model.sh" "$CONTAINER_NAME:/usr/local/bin/sync-model.sh"
-    docker exec "$CONTAINER_NAME" chmod 0755 /usr/local/bin/sync-model.sh
-  fi
-  docker exec "$CONTAINER_NAME" /usr/local/bin/sync-model.sh
-else
-  echo "Container '$CONTAINER_NAME' is not running."
-  echo "Synced model list to $MODEL_DIR/model_list.yml."
-  echo "Run ./launch-container.sh to start the container with the updated model list."
-fi
+echo "Reloading model list and syncing models in container '$CONTAINER_NAME'..."
+docker exec "$CONTAINER_NAME" python3 /usr/local/bin/sync-model.py

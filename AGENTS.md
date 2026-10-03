@@ -8,7 +8,7 @@
 llama.cpp (llama-server) を Docker コンテナで実行するラッパー。
 複数の GGUF モデルを router mode で切り替えながら提供し、Ollama API 互換・OpenAI API 互換エンドポイントを公開する。
 
-- 技術構成: **Bash スクリプト中心** + Python3 (stdlib のみ) の軽量プロキシ。Node.js / Go 等の依存パッケージは存在しない
+- 技術構成: ホスト側は Bash、コンテナ内の制御・モデル同期・preset計算は Python3 (stdlib のみ)。Node.js / Go 等の依存パッケージは存在しない
 - ベースイメージ: `ghcr.io/ggml-org/llama.cpp:full-cuda`
 - 公開ポート: `11434` (Ollama 互換 `/api/*` + OpenAI 互換 `/v1/*`)
 
@@ -21,7 +21,7 @@ llama.cpp (llama-server) を Docker コンテナで実行するラッパー。
 | `unload-model.sh`      | ホスト側からモデルを VRAM からアンロード                                               |
 | `model_list.yml`       | ユーザー編集対象のモデル・MTP/mmproj/imatrix指定ファイル                         |
 | `model_list.example.yml` | `model_list.yml` が無い場合の初期値の元                                      |
-| `docker/`              | コンテナイメージの中身 (Dockerfile + スクリプト + プロキシ)                            |
+| `docker/`              | コンテナイメージの中身 (Dockerfile + Python 制御スクリプト + API プロキシ)              |
 | `models/`              | モデル GGUF のダウンロード先 (.gitignore 済み。**この中のファイルは絶対に編集しない**) |
 | `continue/config.yaml` | Continue (VS Code) 用の設定サンプル                                                    |
 
@@ -36,9 +36,9 @@ llama.cpp (llama-server) を Docker コンテナで実行するラッパー。
 
 ## 主要な動作の流れ (変更を検討する前に必ず把握すること)
 
-1. `launch-container.sh` → イメージビルド → コンテナ起動 (ENTRYPOINT は `docker/start-llama.sh`)
-2. `start-llama.sh` → `sync-model.sh` (モデルの DL / 不要削除) → 軽量 preset 生成 → `lazy-llama-proxy.py` と llama-server (router) を起動
-3. リクエストが公開ポート `11434` に到着 → プロキシが `model` を確認 → **前回と異なる場合だけ** `configure-model-preset.sh` を実行して preset を再計算し llama-server に reload
+1. `launch-container.sh` → イメージビルド → コンテナ起動 (`start-llama.sh` は `start-llama.py` の互換ランチャー)
+2. `start-llama.py` → `sync-model.py` (モデルの DL / 不要削除) → 軽量 preset 生成 → `lazy-llama-proxy.py` と llama-server (router) を起動
+3. リクエストが公開ポート `11434` に到着 → プロキシが `model` を確認 → **前回と異なる場合だけ** `configure-model-preset.py` を実行して preset を再計算し llama-server に reload
 4. アイドル `MODEL_IDLE_SECONDS` 超過でモデルが VRAM から自動解放 (`--sleep-idle-seconds`)
 
 ## 開発・検証の手順
@@ -79,8 +79,8 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 
 ### スクリプトの検証
 
-- Bash スクリプトは `set -euo pipefail` を維持する
-- 可能な範囲では `bash -n <script>` で構文チェックを行う
+- ホスト側 Bash スクリプトは `set -euo pipefail` を維持する。コンテナ内の `.sh` は既存パス互換のための薄い Python 起動ラッパーとする
+- 可能な範囲では `bash -n <script>` と `python3 -m py_compile <script>` で構文チェックを行う
 - 検証には本物の GPU・モデル DL が要るため、実行結果の確認はユーザーへの依頼を前提とする
 
 ## 文書メンテナンスルール

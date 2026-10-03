@@ -531,7 +531,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
 
             self.log_message("preparing lazy preset for model switch: %s", canonical_model)
             subprocess.run(
-                ["/usr/local/bin/configure-model-preset.sh", canonical_model],
+                ["python3", "/usr/local/bin/configure-model-preset.py", canonical_model],
                 check=True,
                 env=os.environ.copy(),
             )
@@ -1139,7 +1139,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             self.log_message("reloading model list from model_list.yml / MODEL_NAMES_CSV...")
             try:
                 subprocess.run(
-                    ["/usr/local/bin/sync-model.sh"],
+                    ["python3", "/usr/local/bin/sync-model.py"],
                     check=True,
                     env=os.environ.copy(),
                 )
