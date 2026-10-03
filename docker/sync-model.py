@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 
 MODEL_DIR = Path(os.environ.get("MODEL_DIR") or "/models")
+AUTO_CONTEXT_SIZE_MAX = 262144
 MODEL_LIST_FILE = Path(os.environ.get("MODEL_LIST_FILE") or MODEL_DIR / "model_list.yml")
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
 PRESET_FILE = Path(os.environ.get("PRESET_FILE") or MODEL_DIR / ".models-preset.ini")
@@ -258,14 +259,17 @@ def process_model(
         destination.unlink(missing_ok=True)
         raise
 
-    configured_context = int(os.environ.get("CONTEXT_SIZE") or detected_context)
+    configured_context = int(
+        os.environ.get("CONTEXT_SIZE")
+        or min(detected_context, AUTO_CONTEXT_SIZE_MAX)
+    )
     max_context = os.environ.get("MAX_CONTEXT_SIZE")
     if max_context and configured_context > int(max_context):
         configured_context = int(max_context)
     alias = filename.removesuffix(".gguf")
     metadata_line = f"{filename}\t{signature(destination)}\t{architecture}\t{detected_context}"
     alias_line = f"{alias}\t{filename}\t{architecture}\t{configured_context}"
-    cache_type = os.environ.get("KV_CACHE_TYPE") or "f16"
+    cache_type = os.environ.get("KV_CACHE_TYPE") or "q4_0"
     lines = [
         f"[{alias}]",
         f"model = {destination}",

@@ -9,7 +9,7 @@ Docker コンテナ上で動かすためのラッパーです。
 
 - ホスト環境には Docker 以外の追加インストールが不要(モデルのダウンロード・配置もコンテナ内で完結)
 - `model_list.yml` で指定した Hugging Face 上のモデルと補助ファイルを自動ダウンロード・配置
-- YAML の `mtp` (ドラフトモデル) / `mmproj` (マルチモーダル投影) をモデルごとに指定し、llama-serverへ自動適用。`imatrix` は自動ダウンロードのみ行う(推論時には使用されない)
+- 投機的デコード(MTP)は既定で無効。出力速度を実測して有効にする場合は、内蔵MTPヘッドまたは YAML の `mtp` (ドラフトモデル) を使用。`mmproj` はモデルごとに指定してllama-serverへ自動適用し、`imatrix` は自動ダウンロードのみ行う(推論時には使用されない)
 - リストにないモデル(キャッシュ済みファイル)は起動時に自動削除
 - `CUDA_VISIBLE_DEVICES` を参照し、未設定なら全 GPU を使用
 - 一定時間(デフォルト30分、環境変数で変更可)アイドルなモデルは VRAM を自動解放
@@ -76,6 +76,7 @@ Ollamaストリーミング応答では、一定長以上の同一ブロック�
 既定の上限を設けないため、反復していない正常な長文生成は継続できます。また、同じtool callと
 同じtool結果を含む1～4ステップの周期が3回続いた場合は、次のtool call生成を始める前にAgentループ
 として停止します。ポーリングなどで結果が変化している場合は同一ループとは判定しません。
+OpenAI互換APIのストリーミング応答も、バックエンドから到着したチャンクを大きな読取バッファが埋まるまで待たずに転送します。
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
@@ -97,7 +98,7 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 ### 2. モデルリストを変更する
 
 自分が使いたいモデルを指定・変更する場合は、`model_list.yml` を編集します。
-`models` 配列の各要素に `url` を指定し、必要なら `mtp` (投機的デコーディング用ドラフトモデル、llama-server の `model-draft` として自動適用)、`mmproj` (マルチモーダル投影、`mmproj` として自動適用) のURLを追加します。`imatrix` (量子化用データ、再量子化などに使う場合のみ) はダウンロードだけ行い、llama-server の推論設定には反映されません(llama-serverに imatrix を読み込む実行時オプションが無いため)。
+`models` 配列の各要素に `url` を指定し、必要なら `mtp` (投機的デコーディング用ドラフトモデル、llama-server の `model-draft` として自動適用)、`mmproj` (マルチモーダル投影、`mmproj` として自動適用) のURLを追加します。投機的デコードは既定で無効です。`SPECULATIVE_DECODING=on` を設定すると、`mtp` 指定時は `draft-simple`、GGUF内に対応する内蔵MTPヘッドがある場合は `draft-mtp` を使用します。有効化時のドラフトKVキャッシュはQ4です。`imatrix` (量子化用データ、再量子化などに使う場合のみ) はダウンロードだけ行い、llama-server の推論設定には反映されません(llama-serverに imatrix を読み込む実行時オプションが無いため)。
 
 ```text
 # model_list.yml の例
@@ -180,20 +181,20 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `http_proxy` / `https_proxy` / `no_proxy` (および大文字版、`all_proxy`) | (未設定=不使用)          | ホスト側のプロキシ設定をコンテナに引き継ぐ。モデルダウンロード(`sync-model.sh` の curl)に使用される。コンテナ内部の通信は常に `127.0.0.1` / `localhost` が `no_proxy` に追加されるためプロキシを回避しない                                                                                                                                                                                                                                                                                                                                                                                  |
 | `MODEL_IDLE_SECONDS`                                                    | `1800`                   | この秒数(デフォルト30分)アイドルが続いたモデルは VRAM から解放される                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `CONTEXT_SIZE`                                                          | (未設定=自動検出)        | 全モデル共通のコンテキスト長を固定したい場合に指定。未指定時はモデルの GGUF メタデータ(`<arch>.context_length`)から推奨値を自動検出                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `MAX_CONTEXT_SIZE`                                                      | (未設定=上限なし)        | 自動検出したコンテキスト長に上限をかけたい場合に指定(VRAM保護用)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `MAX_CONTEXT_SIZE`                                                      | (未設定=自動上限256K)    | コンテキスト長の上限。自動検出時はモデルの対応長と256Kの小さい方を使用。明示すれば256Kを超える設定も可能                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `MIN_CONTEXT_SIZE`                                                      | `2048`                   | KV キャッシュが VRAM に収まらず自動でコンテキスト長を切り詰める際の下限。これを下回る場合のみ `--fit` にフォールバックする                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `CONTEXT_SIZE_STEP`                                                     | `1024`                   | コンテキスト長を自動で切り詰める際の丸め単位                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `N_GPU_LAYERS`                                                          | `auto`                   | GPU に載せるレイヤー数。`auto`/`all`/数値を指定可能。`auto` の場合は後述の `--fit` に判断を委ねる                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `MODELS_MAX`                                                            | `1`                      | 同時にロードしておくモデル数の上限(router mode)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `MAX_PARALLEL_SLOTS`                                                    | `4`                      | 1 モデルあたりの同時実行スロット数の**上限**。llama-server の KV キャッシュは全スロットで共有されるため、実際のスロット数は「各スロットがコンテキスト長を丸ごと確保できる本数」まで VRAM 見積もりから自動で切り下げられる(1 本分しか確保できなければ 1 = 逐次実行)。`1` を指定すると常に逐次実行になる                                                                                                                                                                                                                                                                                       |
+| `MAX_PARALLEL_SLOTS`                                                    | `1`                      | 同時実行スロット数の上限。既定は単一リクエストの出力速度を優先して1。複数同時リクエストの合計tok/sを優先する場合に増やす(同時実行中は1リクエストあたりの速度が下がる場合がある)                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `FLASH_ATTN`                                                            | `on`                     | Flash Attentionの使用設定。`on`/`off`/`auto`を指定可能                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `BATCH_SIZE`                                                            | `1024`                   | prompt処理の論理バッチサイズ。llama.cpp既定値の2048より小さくして一時的なVRAM使用量を抑制                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `UBATCH_SIZE`                                                           | `256`                    | prompt処理の物理バッチサイズ。llama.cpp既定値の512より小さくして計算バッファのVRAM使用量を抑制。`BATCH_SIZE`以下で指定                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `VRAM_RESERVE_MIB`                                                      | `4096`                   | `--fit`と手動`tensor-split`計算でGPUごとに確保する、compute bufferとCUDAワークスペースを含むランタイム用のVRAM余白(MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `MOE_CPU_OFFLOAD`                                                       | `auto`                   | MoE expert重みのCPU配置。`auto`はアクティブexpert比率が閾値以下の場合、KV確保後に収まらないexpert層だけCPUへ配置。`all`はすべてのMoEモデルで同じ調整を有効化、`off`は無効化                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `MOE_CPU_OFFLOAD`                                                       | `auto`                   | MoE expert重みのCPU配置。GPUに全重みを載せられない場合に限り、`auto`はアクティブexpert比率が閾値以下のモデルで必要最小限の先頭層をCPUへ配置。`all`は比率によらず検討、`off`は無効化                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `MOE_ACTIVE_RATIO_THRESHOLD`                                            | `0.125`                  | `MOE_CPU_OFFLOAD=auto`でCPU配置を有効にする`expert_used_count / expert_count`の上限                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `MOE_RAM_RESERVE_MIB`                                                   | `8192`                   | MoE expert重み / Dense FFN重みをCPUへ配置した後も残すホストRAMの余白(MiB)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `KV_CACHE_TYPE`                                                         | (未設定=自動選択)        | KVキャッシュの量子化タイプを固定したい場合に指定。KとVは常に同じ型(`cache-type-k` == `cache-type-v`)になるように保証されます。未指定時は `q4_0` を基本とし、重みと並列スロット分を確保してもVRAMが余る場合のみ `f16` → `q8_0` の順に引き上げる(詳細は「KV キャッシュ・重み・並列数の優先順位」を参照)。指定時はその型に固定され、引き上げは行わない。allowed: `f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`                                                                                                                                                                                                       |
+| `KV_CACHE_TYPE`                                                         | (未設定=`q4_0`)          | KVキャッシュの型を指定。未指定時に高精度型へ自動引き上げず`q4_0`を維持し、VRAMをモデル重みへ優先する。KとVは同じ型。`f16` / `q8_0`等は明示指定可能。型ごとの出力速度はGPU・モデル・コンテキストに依存するため実測を推奨                                                                                                                                                                                                                                                                                                                                                                      |
 | `TENSOR_SPLIT_MODE`                                                     | `auto`                   | 複数 GPU 構成での層分割方法。`auto` の場合、モデル切替時に GPU 毎の生成速度と空き VRAM を実測し、対象モデルの性能比に応じた `tensor-split` を計算して高速化を図る(収まらない場合は自動的に `--fit` 任せへフォールバック)。`off` にすると常に `--fit` 任せの従来動作になる。`SPLIT_MODE` が `layer` 以外の場合はこの計算自体を行わない                                                                                                                                                                                                                                                       |
 | `SPLIT_MODE`                                                            | `layer`                  | llama-server の `--split-mode`。複数 GPU 間でのモデル分割方式。`layer`(既定): レイヤー単位でGPUに分割するパイプライン並列。1トークン生成中は常にどれか1枚のGPUのみが計算するため、GPU使用率は50%前後(2GPU時)に留まりやすい仕様。`row`: 各レイヤーの重みを行単位でGPU間に分割するテンソル並列で、全GPUが同時に計算に参加できる。`tensor`: 重みとKVキャッシュの両方を分割(実験的)。`none`: 単一GPUのみ使用。**注意**: `row`/`tensor` は毎レイヤーGPU間の同期が発生するため、NVLink等の高速な相互接続が無い環境(PCIe経由のみ)や性能の異なるGPUの組み合わせでは、`layer` より遅くなることがある |
 | `THINKING_MODE`                                                         | `auto`                   | Qwen3.6-35B-A3B-UD 等の思考型モデルにおける推論プロセスの出力制御。`on`: thinking モードを有効化 (推論プロセスの出力を許可)。`off`: thinking モードを無効化 (推論プロセスの出力を抑制)。`auto` (デフォルト): リクエストに thinking パラメータがあればそれを使用、なければ有効。Ollama 互換・OpenAI 互換の両 API で動作し、リクエスト/レスポンス両方から `reasoning_content`, `thinking_content`, `reasoning`, `thoughts` 等のフィールドを自動で除去します。 |
@@ -207,6 +208,7 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 | `TOOL_LOOP_DETECTION`                                                   | `on`                     | 同じtool call引数と同じtool結果を含む短周期の反復を受信履歴から検出し、次のバックエンド実行前に停止する。`off`で無効化 |
 | `TOOL_LOOP_REPEAT_COUNT`                                                | `3`                      | 同一tool実行周期をAgentループと判定する連続回数 |
 | `TOOL_LOOP_MAX_CYCLE_LENGTH`                                            | `4`                      | Agentループとして検査するtool実行周期の最大ステップ数 |
+| `SPECULATIVE_DECODING`                                                  | `off`                    | `on`にすると、対応する内蔵MTPヘッドまたは`model_list.yml`で指定したドラフトモデルを使った投機的デコードを有効化。draft KVはQ4 |
 
 ## VRAM 管理の仕組み
 
@@ -215,25 +217,77 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
 - **計算バッファと共有KVの省メモリ化**: Flash Attentionを有効にし、`BATCH_SIZE` / `UBATCH_SIZE`を
   llama.cppの既定値より小さくしています。また、`--kv-unified`により並列スロット間で単一のKVバッファを共有します。
   バッチサイズをさらに下げるとVRAMを節約できますが、長いpromptの処理速度は低下します。
-- **同時実行スロット数の自動決定**: `--kv-unified` ではKVバッファが全スロットで共有されるため、スロット数を
-  無条件に増やすと「個々のリクエストは`ctx-size`未満なのに、同時実行の合算で溢れて
-  `Context size has been exceeded` になる」状態が起こります。そこで本サーバは、各スロットがコンテキスト長を
-  丸ごと確保できる本数(= 空きVRAM ÷ 1スロット分のKVキャッシュ量)だけをスロットとして開き、`ctx-size`には
-  その合計値、`kv-unified-per-slot`には1リクエストあたりの上限を指定します。1本分しか確保できない場合は
-  1スロット(逐次実行)となり、1リクエストがコンテキスト全量を使えることが保証されます。上限は
-  `MAX_PARALLEL_SLOTS`で調整できます。並列スロットの確保は、モデルの重みがVRAMに載った後の余りで行われます
-  (後述の優先順位を参照)。
+- **単一リクエストの出力速度優先**: 既定では`MAX_PARALLEL_SLOTS=1`とし、同時リクエストによるGPU演算・メモリ帯域の
+  競合を避けます。複数リクエストの合計tok/sを優先する場合は上限を増やしてください。llama-serverの`--kv-unified`
+  ではKVバッファを共有するため、実際のスロット数はVRAM上限と`MAX_PARALLEL_SLOTS`の小さい方になります。
 - **低アクティブ率MoEの自動CPU配置**: GGUFの`expert_count`と`expert_used_count`を調べ、既定では
-  1トークンあたりのアクティブexpert比率が12.5%以下なら、まず全expertをCPUへ置ける前提でKVキャッシュを確保します。
-  その後`n-cpu-moe`を0から順に試し、KVキャッシュとVRAM余白を維持したまま成立する最小値を採用します。
-  したがって、残ったVRAMには可能な限り多くのexpert重みが戻され、収まらない先頭側のexpert層だけがCPUへ配置されます。
-  KVキャッシュはGPU間で均等と仮定せず、各GPUへ割り当てられるAttention層のKV head数に応じて計上します。
-  必要なホストRAMを確保できない場合は自動的にCPU配置を見送ります。CPU配置したexpertの計算・転送により、
-  生成速度が低下する可能性があります。
-- **OOM 回避 (`--fit`)**: 基本方針として `tensor-split` や `n-gpu-layers` は固定値指定を避け、llama-server 側の
-  自動フィット機能(`--fit`, デフォルト有効)に GPU 間のレイヤー配置やコンテキストサイズの調整を委ねています。
-  これは、固定値を指定すると `--fit` が「ユーザー指定済み」と判断して調整を放棄し、VRAM に収まらない場合に
-  OOM で起動失敗することがあるためです。
+  1トークンあたりのアクティブexpert比率が12.5%以下ならCPU配置を検討します。単一GPUかつ`SPLIT_MODE=layer`では
+  GGUFの層ごとのexpert重みを使い、KVキャッシュとVRAM余白を維持できる最小数の先頭層だけを`n-cpu-moe`でCPUへ配置します。
+  退避する層の重みと`MOE_RAM_RESERVE_MIB`を空きホストRAM内に確保できない場合は、CPU配置を行わず`--fit`に委ねます。
+  複数GPUの自動tensor-splitでは、低アクティブ率MoEのexpert重みをRAMに置ける場合だけCPU配置を候補にします。
+  Dense FFN重みはホストRAMに余裕があってもCPUへ退避せず、decode時はGPUに配置します。
+  `n-cpu-moe`は層単位の静的配置であり、Strataのような実行時のexpert利用頻度に応じた動的キャッシュではありません。
+  CPU配置したexpertの計算・転送により生成速度が低下する可能性があります。
+- **Qwen 27Bの出力速度実測**: RTX 5070 Ti + RTX 4060 Ti、同一の88-token prompt、temperature 0、
+  192-token生成、256K context、Q4 KVで各3回測定したdecode速度の平均です。
+
+  | 構成 | decode速度 |
+  | --- | ---: |
+  | 既存構成 (split 26/39、Dense FFNの先頭16層をCPU配置、MTPなし) | 9.01 tok/s |
+  | Dense FFNをGPU配置 (split 26/39、MTPなし) | 16.40 tok/s |
+  | 5070 Ti側へ寄せたsplit 34/31 (MTPなし) | 17.33 tok/s |
+  | split 34/31 + 内蔵MTP、draft KVをQ4化 | 23.95 tok/s |
+
+  この測定ではDense FFNのCPU退避をなくすと約82%、さらにsplitを調整すると約6%、MTPを有効にすると
+  MTPなしのsplit 34/31比で約38%向上しました。MTP構成はGPUの空きが最小約548 MiBまで減り、
+  VRAM余裕が小さくなります。OOMが発生する場合は`SPECULATIVE_DECODING=off`、`MAX_CONTEXT_SIZE`の縮小、
+  または`VRAM_RESERVE_MIB`の増加を検討してください。実際の速度・VRAM消費はモデル、GPU負荷、prompt、
+  コンテキスト長により変わります。
+- **Qwen GSQでのMTP比較 (過去測定)**: 同一の88-token prompt、temperature 0、192-token生成、256K context、Q4 KVで各3回測定し、
+  MTP ONは平均12.63 tok/s (draft受理率52.5%)、OFFは23.15 tok/sでした。ただしONは公開API、OFFは一時起動した
+  llama-serverへの直接CLIで測定したため、測定経路が一致していません。厳密なA/B比較ではなく参考値として扱い、
+  MTPは既定OFFのままモデルごとに公開API上で再測定してください。
+- **Qwen GSQの公開API測定 (2026-10-03)**: RTX 5070 Ti + RTX 4060 Ti、MTP OFF、temperature 0、
+  192-token出力 (`finish_reason=length`)、`/v1/chat/completions` の非ストリーミング応答を各3回測定したdecode速度の平均です。
+  コンテキスト長は262144、KVはQ4、Flash Attentionは有効、batch/ubatchは1024/256、並列スロットは1。
+  現行モデル引数は`--fit on --n-gpu-layers auto`で、手動tensor-splitは成立せず`--fit`へフォールバックしていました。
+
+  | 入力prompt tokens | 平均decode速度 |
+  | ---: | ---: |
+  | 99 | 22.83 tok/s |
+  | 4,372 | 22.25 tok/s |
+  | 16,252 | 20.49 tok/s |
+  | 64,852 | 15.26 tok/s |
+
+  各promptは同一条件の3連続測定です。ただし`timings.predicted_per_second`はモデルが生成した全completion tokenを数え、
+  非表示のreasoning tokenを含む場合があります。実際に99-token promptで192-token上限の応答を調べると、
+  OpenAI応答の`message.content`は空で`reasoning_content`が999文字でした。Ollama APIでもthinking既定時に1024 tokenを生成した応答は
+  可視contentが空のまま上限に達しました。このため上表はGPU decode能力の測定であり、Ollamaクライアントに表示される回答の
+  tok/sを再現する測定ではありません。
+- **Qwen GSQでのTHINKING_MODE A/B (2026-10-03)**: 同一のユーザーpromptを`/api/chat`、temperature 0、
+  `num_predict=512`で3回ずつ測定しました。
+
+  | 設定 | completion tokens | 可視content | 平均decode速度 |
+  | --- | ---: | ---: | ---: |
+  | `THINKING_MODE=auto` (既定) | 512 | 0文字 | 23.02 tok/s |
+  | `THINKING_MODE=off` | 471 | 2,234文字 | 22.96 tok/s |
+
+  raw decode速度はほぼ同じですが、`auto`では512 tokenを内部thinkingに使い切り、ユーザーに見える回答がありませんでした。
+  `off`では推論内容より回答本文を生成し、同じtoken上限で回答が得られました。`off`は回答の仕方を変える設定なので、
+  速度だけでなく回答品質を確認してから選択してください。計測後のコンテナは`auto` (環境変数未指定)に戻しています。
+- **Qwen GSQでthinkingを抑えた可視回答速度**: `/api/chat`、temperature 0、同一の91-token prompt、`num_predict=1024`で3回測定しました。
+  Qwenが対応する`/no_think`指示をprompt先頭に付けると、各回789 completion tokens・1726文字の回答が生成され、
+  `eval_duration`から求めた平均decode速度は22.80 tok/s (23.05 / 22.46 / 22.89)でした。これはthinking既定を変更せずに行った診断測定で、
+  `/no_think`は回答の仕方を変えるため、品質とのトレードオフを確認せず全リクエストへ適用しないでください。
+  報告された約10 tok/sはGPUのraw decodeでは再現できず、Qwenの非表示thinkingが回答開始を遅らせている可能性があります。
+  次の最適化ではGPU配置やKV型を先に変えず、実際の会話でthinkingを維持する場合と抑える場合を同一prompt・同一APIで比較してください。
+- **投機的デコード(MTP)**: `SPECULATIVE_DECODING=off`が既定です。`on`を指定すると、モデル切替時にGGUFテンソルを確認し、
+  対応する内蔵MTPヘッドには`draft-mtp`、`mtp`指定の外部ドラフトモデルには`draft-simple`を設定します。
+  draft KVはQ4にして追加VRAMを抑えます。MTPに対応しない通常モデルではオプションを追加しません。
+  MTPは追加のVRAMを使い、モデルによっては出力速度が低下するため、モデル別の比較で効果を確認してください。
+- **推論時のGPU常駐優先**: 単一GPUではVRAM見積もりが成立すると`fit = off` / `n-gpu-layers = all`を明示し、
+  全重みをGPUに配置します。低アクティブ率MoEで全重みが収まらない場合だけ、RAM余裕の範囲内で必要最小限の
+  先頭expert層を`n-cpu-moe`へ配置します。容量を見積もれない場合は安全側としてllama-serverの`--fit`へ戻します。
 - **モデル切替時の遅延 preset 計算**: 公開ポートでは軽量プロキシがリクエストを受け、`model` が直前のモデルから
   変わった場合だけ対象モデルの preset を再計算して llama-server router に reload します。起動時は全モデルに対して
   KV キャッシュ量子化・GGUF テンソル解析・`tensor-split` 計算を行わないため、モデル数が増えても起動時間が伸びにくくなります。
@@ -243,35 +297,29 @@ curl -X POST http://localhost:11434/models/unload -H "Content-Type: application/
   ベンチマークには単一 GPU に確実に収まる小サイズのモデルを使用します(各 GPU の空き VRAM が少なく、対象モデル
   単体ではロードできない場合があるため)。計算時には各 GPU の空き VRAM・GGUF のテンソル情報から求めた
   レヤー毎の重みサイズ・KV キャッシュの必要量を考慮し、OOM しない範囲に収まるように按分します。
-  予算内に収まらない場合はログに警告を出したうえで手動指定を諦め、通常通り `--fit` 任せの自動調整に
-  フォールバックします(preset ファイル内で `fit = off` / `fit = on` を切り替えることで実現しており、
-  コマンドライン引数側では固定しません)。単一 GPU の場合や `TENSOR_SPLIT_MODE=off` の場合はこの計算は行わず、
-  常に `--fit` 任せになります。
-- **コンテキスト長の自動検出**: `CONTEXT_SIZE` を指定しない場合、モデル切替時に `gguf-dump` を使って対象モデルの GGUF メタデータから
-  `<arch>.context_length`(モデルが学習時にサポートする最大コンテキスト長)を読み取り、`ctx-size` に設定します。
-- **KV キャッシュ・重み・並列数の優先順位**: モデル切替時に、GGUF メタデータ(`block_count` /
+  予算内に収まらない場合はログに警告を出したうえで手動指定を諦め、`--fit`へフォールバックします。手動splitが
+  成立する場合は`fit = off`として計算した配置を使います。単一GPUの配置は上記のGPU常駐見積もりで処理し、
+  `TENSOR_SPLIT_MODE=off`では複数GPUの手動splitを行いません。
+- **コンテキスト長の自動検出**: `CONTEXT_SIZE`を指定しない場合はGGUFの最大対応長と256Kの小さい方を上限とし、
+  VRAM見積もりが不足する場合のみさらに縮めます。256Kを超える長さが必要な場合は`CONTEXT_SIZE`を明示してください。
+- **出力速度を優先したVRAM配分**: モデル切替時に、GGUFメタデータ(`block_count` /
   `attention.head_count_kv` / `attention.key_length` / `attention.value_length`)から必要 KV キャッシュ量を求め、
-  GPU ごとの空き VRAM から `VRAM_RESERVE_MIB` を差し引いた量を予算として、次の優先順位で割り当てます。
+  GPU ごとの空きVRAMから`VRAM_RESERVE_MIB`を差し引いた量を予算として、次の優先順位で割り当てます。
   `head_count_kv`が層ごとの配列であるSSM/Attentionハイブリッドモデルでは、値が0のSSM層をKV計算から除外します。
   `full_attention_interval` を持つハイブリッドモデルは全長 Attention 層のみを、Sliding Window Attention(SWA)を
   使うモデル(Gemma 等)は SWA 層をウィンドウ分(`sliding_window` × スロット数 + `UBATCH_SIZE`)のみとして計算します。
   また量子化 KV では Flash Attention が K/V を f16 へ展開する作業領域(1層分 × 総トークン数)と KQ マスクが
   compute buffer に載るため、これが `VRAM_RESERVE_MIB` の半分を超える分も KV の所要量として加算します。
-  1. **KV キャッシュ(`q4_0`)をコンテキスト全量で VRAM に載せる**: `KV_CACHE_TYPE` 未指定時は `q4_0` を基本とします
-     (指定時はその型)。予算に収まらない場合のみ `ctx-size` を切り詰めます(`CONTEXT_SIZE_STEP` の倍数に丸め、
-     `MIN_CONTEXT_SIZE` を下限とします)。
-  2. **モデルの重みを VRAM に載せる**: 載りきらない場合は、Attention 層と KV キャッシュを GPU に残したまま、
-     先頭側の層の FFN 重み(Dense モデルは `n-cpu-ffn`、MoE モデルは後述の `n-cpu-moe`)だけを CPU へ退避します。
-     コンテキスト長は削りません(生成速度は低下します)。
-  3. **並列スロット分の KV キャッシュを確保する**: 重みを載せた後の余りで、CPU へ退避する層を増やさずに
-     確保できる本数だけスロットを開きます(上限 `MAX_PARALLEL_SLOTS`)。
-  4. **KV キャッシュ型の引き上げ**: それでも余る場合のみ、`f16` → `q8_0` の順に収まる最も精度の高い型へ引き上げます
-     (`KV_CACHE_TYPE` 指定時は引き上げません)。
+  1. **長いコンテキストの維持**: 自動検出では最大256Kを目標にし、ユーザーが指定した`CONTEXT_SIZE`は優先します。
+  2. **モデル重みのGPU常駐**: 可能なら全レイヤーをGPUへ配置します。通常のVRAM計算で全重みを載せられない
+     低アクティブ率MoEのみ、速度低下を許容できるCPU expert配置を検討します。
+  3. **単一リクエストの速度**: 既定は1スロットで、並列リクエストより単一生成の速度を優先します。
+  4. **KVキャッシュ型**: 既定の`q4_0`から自動で高精度型へ引き上げません。量子化KVの実速度はモデル/GPUに依存するため、
+     比較したい場合は`KV_CACHE_TYPE`を明示して実測してください。
 
-  複数 GPU で `TENSOR_SPLIT_MODE=auto` の場合は、上記を GPU ごとの層配置(`tensor-split`)まで含めて検証します。
-  単一 GPU・`TENSOR_SPLIT_MODE=off`・`SPLIT_MODE` が `layer` 以外の場合は見積もりのみで決定し、重みが載りきらない
-  場合の配置は `--fit` に委ねます(この場合、CPU へ退避された層の KV キャッシュは CPU 側に置かれます)。
-  KV キャッシュを基本型でも 1 スロット分すら確保できない場合も `--fit` 任せにフォールバックします。
+  複数GPUで`TENSOR_SPLIT_MODE=auto`の場合は、各GPUの空きVRAMと`llama-bench`の測定速度を使って`tensor-split`を
+  計算します。単一GPUのMoEでRAMが十分でない場合、またはKV/重みの見積もりが不成立の場合は`--fit`へフォールバック
+  することがあります。これらは容量確保のための代替経路であり、最大tok/sを実機測定で保証するものではありません。
 
 ## Continue (VS Code拡張) との連携
 
@@ -298,8 +346,8 @@ models:
 ### `500 model name=... failed to load` (OOM)
 
 - `docker logs my-llm-server` で `cudaMalloc failed: out of memory` が出ていないか確認してください。
-- 通常は KV キャッシュ量子化が空き VRAM から自動選択されるため発生しにくいですが、他プロセスが GPU を
-  使用中で空き VRAM が少ない場合などはそれでも収まらないことがあります。その場合は `VRAM_RESERVE_MIB` を
+- 既定ではQ4 KVを使用し、見積もりに基づいてコンテキスト長やGPU配置を決めますが、他プロセスがGPUを
+  使用中で空きVRAMが少ない場合などはそれでも収まらないことがあります。その場合は `VRAM_RESERVE_MIB` を
   増やすか、`MAX_CONTEXT_SIZE` でコンテキスト長自体を制限してください。
 
 ### リクエストが `context size exceeded` 的なエラーになる

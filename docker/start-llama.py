@@ -40,7 +40,7 @@ def validate() -> dict[str, str]:
         "CONTEXT_SIZE_STEP": setting("CONTEXT_SIZE_STEP", "1024"),
         "N_GPU_LAYERS": setting("N_GPU_LAYERS", "auto"),
         "MODELS_MAX": setting("MODELS_MAX", "1"),
-        "MAX_PARALLEL_SLOTS": setting("MAX_PARALLEL_SLOTS", "4"),
+        "MAX_PARALLEL_SLOTS": setting("MAX_PARALLEL_SLOTS", "1"),
         "FLASH_ATTN": setting("FLASH_ATTN", "on"),
         "BATCH_SIZE": setting("BATCH_SIZE", "1024"),
         "UBATCH_SIZE": setting("UBATCH_SIZE", "256"),
@@ -51,6 +51,7 @@ def validate() -> dict[str, str]:
         "TENSOR_SPLIT_MODE": setting("TENSOR_SPLIT_MODE", "auto"),
         "SPLIT_MODE": setting("SPLIT_MODE", "layer"),
         "KV_CACHE_TYPE": os.environ.get("KV_CACHE_TYPE", ""),
+        "SPECULATIVE_DECODING": setting("SPECULATIVE_DECODING", "off"),
         "THINKING_MODE": setting("THINKING_MODE", "auto"),
         "GENERATION_LOOP_DETECTION": setting("GENERATION_LOOP_DETECTION", "on"),
         "GENERATION_LOOP_WINDOW_CHARS": setting("GENERATION_LOOP_WINDOW_CHARS", "16384"),
@@ -90,6 +91,7 @@ def validate() -> dict[str, str]:
         "MOE_CPU_OFFLOAD": {"auto", "off", "all"},
         "TENSOR_SPLIT_MODE": {"auto", "off"},
         "SPLIT_MODE": {"none", "layer", "row", "tensor"},
+        "SPECULATIVE_DECODING": {"on", "off"},
         "THINKING_MODE": {"on", "off", "auto"},
     }
     for name, allowed in choices.items():

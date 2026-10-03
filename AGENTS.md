@@ -28,11 +28,14 @@ llama.cpp (llama-server) を Docker コンテナで実行するラッパー。
 ## 変更時の原則 (最重要)
 
 1. **重い処理は起動時に行わない** — KV キャッシュ量子化の選択・`tensor-split` 計算・GGUF メタデータ解析は、すべて「モデルが切り替わった時」にのみ実行する (lazy preset)。これを「起動時に全モデル分まとめて計算」する設計へ改変しない。
-2. **`tensor-split` / `n-gpu-layers` の固定値指定を避ける** — 固定値を指定すると llama-server の `--fit` が調整を放棄し OOM の原因になる。preset ファイル内の `fit = on/off` の切り替えによるフォールバック設計を維持する。
+2. **出力tok/sを優先しつつ、見積もり不能時は安全側へ戻す** — 既定は単一リクエストを優先する。単一GPUで重み・KV・予約VRAMの収まりを見積もれた場合は `fit = off` / `n-gpu-layers = all` を明示し、見積もりが不成立または不確実な場合は llama-server の `--fit` にフォールバックする。複数GPUの `tensor-split` は実測速度とVRAM予算に基づいて設定する。
 3. **Ollama / OpenAI 両互換エンドポイントの API 形状は破壊変更しない** — ollama-vscode / Continue / Copilot Chat といったクライアントがそのまま使えることが前提。
 4. **環境変数は README.md とスクリプト両方に反映する** — `launch-container.sh` が環境変数を `-e` でコンテナへ渡すループ (`for var in ...`) と、README の環境変数一覧表の両方に追加する必要がある。
 5. **stdlib のみでPythonを書く** — `lazy-llama-proxy.py` は `http.server` / `urllib` 等、標準ライブラリのみ使用。pip 依存パッケージを追加しない。
 6. **ホストの UID/GID でコンテナを動かす設計を壊さない** — モデルファイルを root 権限なしで削除可能にしている仕組み (PUID/PGID)。
+7. **推論配置は単一リクエストの出力速度を優先する** — 自動コンテキストは最大256Kを目標とし、モデル重みのGPU常駐を優先する。既定の並列スロットは1。`MAX_PARALLEL_SLOTS` の増加は合計スループットを選ぶ明示的な調整とする。
+8. **投機的デコードは速度実測に基づき選ぶ** — 既定では無効。明示されたドラフトモデルまたは内蔵MTPヘッドがある場合も、`SPECULATIVE_DECODING=on` が指定されたときだけ使用する。ONにする場合のdraft KVはQ4。
+9. **速度比較は公開APIの同一経路で行う** — 同一モデル・同一prompt token数・同一生成上限・同一sampling条件で複数回測り、実際のモデル起動引数と`timings.predicted_per_second`を記録する。直接CLIとプロキシ経由、または異なるコンテキスト長の数値を同条件として比較しない。思考型モデルではこの値に非表示のreasoning tokenが含まれ得るため、ユーザーに見える回答速度と区別する。
 
 ## 主要な動作の流れ (変更を検討する前に必ず把握すること)
 

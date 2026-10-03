@@ -589,7 +589,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 while True:
-                    chunk = resp.read(64 * 1024)
+                    chunk = resp.read1(64 * 1024)
                     if not chunk:
                         break
                     self.wfile.write(chunk)

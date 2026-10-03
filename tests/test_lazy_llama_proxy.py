@@ -170,5 +170,57 @@ class StreamingLoopGuardTests(unittest.TestCase):
         self.assertEqual([True], backend_closed)
 
 
+class BackendStreamingForwardTests(unittest.TestCase):
+    def test_forwards_available_backend_chunks_without_filling_read_buffer(self):
+        first_chunk = b"data: first\n\n"
+        second_chunk = b"data: second\n\n"
+        writes = io.BytesIO()
+
+        class BackendResponse:
+            status = 200
+            headers = {"Content-Type": "text/event-stream"}
+
+            def __init__(self):
+                self.chunks = [first_chunk, second_chunk, b""]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read1(self, _size):
+                if len(self.chunks) == 2:
+                    self.assert_forwarded(first_chunk)
+                elif len(self.chunks) == 1:
+                    self.assert_forwarded(first_chunk + second_chunk)
+                return self.chunks.pop(0)
+
+            @staticmethod
+            def assert_forwarded(expected):
+                if writes.getvalue() != expected:
+                    raise AssertionError("backend chunk was not forwarded before the next read")
+
+            def read(self, _size=-1):
+                raise AssertionError("buffer-filling read must not be used for backend streams")
+
+        response = BackendResponse()
+        handler = object.__new__(PROXY.LazyProxyHandler)
+        handler.command = "POST"
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Type": "application/json"}
+        handler.wfile = writes
+        handler.close_connection = False
+        handler.send_response = lambda _status: None
+        handler.send_header = lambda _name, _value: None
+        handler.end_headers = lambda: None
+        handler._request_backend = lambda *_args, **_kwargs: response
+
+        handler._forward(b'{"stream":true}')
+
+        self.assertEqual(first_chunk + second_chunk, writes.getvalue())
+        self.assertTrue(handler.close_connection)
+
+
 if __name__ == "__main__":
     unittest.main()

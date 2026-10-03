@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import math
 import os
@@ -22,6 +23,7 @@ SECTION_DIR = Path(os.environ.get("PRESET_SECTION_DIR") or MODEL_DIR / ".models-
 ALIAS_FILE = Path(os.environ.get("MODEL_ALIAS_FILE") or MODEL_DIR / ".model-aliases.tsv")
 UTIL = "/usr/local/bin/model-preset-utils.py"
 MIB = 1024 * 1024
+AUTO_CONTEXT_SIZE_MAX = 262144
 
 
 def env(name: str, default: str) -> str:
@@ -35,7 +37,7 @@ CFG = {
     "MIN_CONTEXT_SIZE": env("MIN_CONTEXT_SIZE", "2048"),
     "CONTEXT_SIZE_STEP": env("CONTEXT_SIZE_STEP", "1024"),
     "N_GPU_LAYERS": env("N_GPU_LAYERS", "auto"),
-    "MAX_PARALLEL_SLOTS": env("MAX_PARALLEL_SLOTS", "4"),
+    "MAX_PARALLEL_SLOTS": env("MAX_PARALLEL_SLOTS", "1"),
     "KV_CACHE_TYPE": os.environ.get("KV_CACHE_TYPE", ""),
     "TENSOR_SPLIT_MODE": env("TENSOR_SPLIT_MODE", "auto"),
     "SPLIT_MODE": env("SPLIT_MODE", "layer"),
@@ -43,6 +45,7 @@ CFG = {
     "MOE_CPU_OFFLOAD": env("MOE_CPU_OFFLOAD", "auto"),
     "MOE_ACTIVE_RATIO_THRESHOLD": env("MOE_ACTIVE_RATIO_THRESHOLD", "0.125"),
     "MOE_RAM_RESERVE_MIB": env("MOE_RAM_RESERVE_MIB", "8192"),
+    "SPECULATIVE_DECODING": env("SPECULATIVE_DECODING", "off"),
     "UBATCH_SIZE": env("UBATCH_SIZE", "256"),
     "LLAMA_ROUTER_PORT": env("LLAMA_ROUTER_PORT", "11435"),
 }
@@ -96,6 +99,17 @@ def parse_json_dump(content: str) -> dict:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def has_mtp_head(content: str) -> bool:
+    tensors = parse_json_dump(content).get("tensors", {})
+    if not isinstance(tensors, dict):
+        return False
+    return any(
+        isinstance(name, str)
+        and re.search(r"\.nextn\.(?:eh_proj|enorm|hnorm|shared_head_norm)\.weight$", name)
+        for name in tensors
+    )
 
 
 def kv_params(model: Path) -> tuple[int, int, int, int, int]:
@@ -237,6 +251,74 @@ def layer_bytes(model: Path, mode: str) -> str:
     return util(args, input_text=gguf_dump(model, tensors=True))
 
 
+def auxiliary_preset_options(alias: str) -> dict[str, str]:
+    section_file = SECTION_DIR / f"{alias}.ini"
+    if not section_file.is_file():
+        return {}
+    preset = configparser.ConfigParser(interpolation=None)
+    preset.read(section_file, encoding="utf-8")
+    if not preset.has_section(alias):
+        return {}
+    return {
+        option: preset.get(alias, option)
+        for option in ("model-draft", "mmproj")
+        if preset.has_option(alias, option)
+    }
+
+
+def single_gpu_moe_plan(
+    layer_data: str,
+    usable_vram: int,
+    params: tuple[int, int, int, int, int],
+    cache_type: str,
+    context: int,
+    max_slots: int,
+    available_ram: int,
+    ram_reserve: int,
+    upgrades: list[str],
+) -> tuple[int, int, int, str] | None:
+    """Choose the smallest CPU expert-layer prefix that fits alongside KV on one GPU."""
+    try:
+        lines = [line.split() for line in layer_data.splitlines() if line.strip()]
+        other_bytes = int(lines[0][0])
+        rows = [tuple(map(int, line)) for line in lines[1:]]
+    except (IndexError, ValueError):
+        return None
+    if not rows or any(len(row) != 4 for row in rows):
+        return None
+
+    base_bytes = sum(row[0] for row in rows)
+    expert_by_layer = [row[1] for row in rows]
+    ram_budget = max(0, available_ram - ram_reserve)
+    offloaded_bytes = 0
+
+    for cpu_layers in range(len(rows) + 1):
+        if cpu_layers:
+            offloaded_bytes += expert_by_layer[cpu_layers - 1]
+            if offloaded_bytes > ram_budget:
+                break
+
+        gpu_weight_bytes = other_bytes + base_bytes + sum(expert_by_layer[cpu_layers:])
+        selected_slots = next(
+            (
+                slots
+                for slots in range(max_slots, 0, -1)
+                if gpu_weight_bytes + kv_vram_bytes(params, cache_type, context, slots) <= usable_vram
+            ),
+            0,
+        )
+        if not selected_slots:
+            continue
+
+        selected_cache = cache_type
+        for candidate in upgrades:
+            if gpu_weight_bytes + kv_vram_bytes(params, candidate, context, selected_slots) <= usable_vram:
+                selected_cache = candidate
+                break
+        return cpu_layers, offloaded_bytes, selected_slots, selected_cache
+    return None
+
+
 def resolve_alias(requested: str) -> tuple[str, str]:
     if not ALIAS_FILE.is_file():
         raise RuntimeError(f"model alias file not found: {ALIAS_FILE}")
@@ -290,15 +372,32 @@ def configure(requested_model: str) -> None:
 
 
 def configure_locked(alias: str, filename: str, model_file: Path) -> None:
+    auxiliary_options = auxiliary_preset_options(alias)
+    auxiliary_model_bytes = sum(
+        Path(path).stat().st_size
+        for path in auxiliary_options.values()
+        if Path(path).is_file()
+    )
     model_data = parse_json_dump(gguf_dump(model_file))
-    context = int(CFG["CONTEXT_SIZE"] or metadata(model_data, ".context_length") or 4096)
+    model_context = int(metadata(model_data, ".context_length") or 4096)
+    context = int(CFG["CONTEXT_SIZE"] or min(model_context, AUTO_CONTEXT_SIZE_MAX))
     if not CFG["CONTEXT_SIZE"] and metadata(model_data, ".context_length"):
-        log(f"Detected context_length for {filename}: {context}")
+        if model_context > AUTO_CONTEXT_SIZE_MAX:
+            log(f"Capping automatically detected ctx-size for {filename} at {AUTO_CONTEXT_SIZE_MAX}")
+        else:
+            log(f"Detected context_length for {filename}: {context}")
     if CFG["MAX_CONTEXT_SIZE"] and context > int(CFG["MAX_CONTEXT_SIZE"]):
         log(f"Capping ctx-size for {filename} from {context} to MAX_CONTEXT_SIZE={CFG['MAX_CONTEXT_SIZE']}")
         context = int(CFG["MAX_CONTEXT_SIZE"])
 
-    moe_profile_text = util(["moe-profile"], input_text=gguf_dump(model_file, tensors=True))
+    tensor_dump = gguf_dump(model_file, tensors=True)
+    moe_profile_text = util(["moe-profile"], input_text=tensor_dump)
+    internal_mtp = (
+        CFG["SPECULATIVE_DECODING"] == "on"
+        and "model-draft" not in auxiliary_options
+        and has_mtp_head(tensor_dump)
+    )
+    del tensor_dump
     moe_profile = [int(item) for item in moe_profile_text.split()] if moe_profile_text else []
     expert_count = moe_profile[1] if len(moe_profile) > 1 else 0
     expert_used = moe_profile[2] if len(moe_profile) > 2 else 0
@@ -309,18 +408,23 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
         or (CFG["MOE_CPU_OFFLOAD"] == "auto" and expert_count > 0 and expert_used > 0
             and expert_used / expert_count <= float(CFG["MOE_ACTIVE_RATIO_THRESHOLD"]))
     )
+    ram_available = available_ram_bytes() if should_offload else 0
+    ram_reserve = int(CFG["MOE_RAM_RESERVE_MIB"]) * MIB
     if should_offload:
-        required = expert_bytes + int(CFG["MOE_RAM_RESERVE_MIB"]) * MIB
-        if available_ram_bytes() >= required:
+        required = expert_bytes + ram_reserve
+        if ram_available >= required:
             moe_auto = True
             ratio = 100 * expert_used / expert_count if expert_count else 0
-            log(f"{filename}: MoE uses {expert_used}/{expert_count} experts ({ratio:.1f}%); prioritizing KV cache")
+            log(f"{filename}: MoE uses {expert_used}/{expert_count} experts ({ratio:.1f}%); RAM is available for measured CPU-placement planning")
             log(f"{filename}: up to {expert_bytes // MIB} MiB of expert weights can be moved to CPU")
+        elif gpu_count == 1:
+            ratio = 100 * expert_used / expert_count if expert_count else 0
+            log(f"{filename}: MoE uses {expert_used}/{expert_count} experts ({ratio:.1f}%); checking partial CPU offload against available RAM")
         else:
             log(f"{filename}: skipping MoE CPU offload because available host RAM is below expert weights plus reserve")
 
     kv_base = CFG["KV_CACHE_TYPE"] or "q4_0"
-    upgrades = [] if CFG["KV_CACHE_TYPE"] else ["f16", "q8_0"]
+    upgrades: list[str] = []
     cache_type = kv_base
     parallel = 1
     model_file_bytes = model_file.stat().st_size
@@ -329,7 +433,8 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
     except (RuntimeError, ValueError):
         params = None
     usable = usable_vram_bytes()
-    fit_fallback = params is None or usable <= 0
+    planning_usable = max(0, usable - auxiliary_model_bytes)
+    fit_fallback = params is None or planning_usable <= 0
     if params is None:
         log(f"Could not detect attention params for {filename}; relying on llama-server's --fit auto-adjustment")
     elif usable <= 0:
@@ -337,11 +442,11 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
 
     if not fit_fallback and params is not None:
         one_slot = kv_vram_bytes(params, kv_base, context)
-        if one_slot > usable:
+        if one_slot > planning_usable:
             low, high = 0, context // int(CFG["CONTEXT_SIZE_STEP"])
             while low < high:
                 mid = (low + high + 1) // 2
-                if kv_vram_bytes(params, kv_base, mid * int(CFG["CONTEXT_SIZE_STEP"])) <= usable:
+                if kv_vram_bytes(params, kv_base, mid * int(CFG["CONTEXT_SIZE_STEP"])) <= planning_usable:
                     low = mid
                 else:
                     high = mid - 1
@@ -354,7 +459,7 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
                 log(f"{filename}: cannot fit {kv_base} KV cache even at MIN_CONTEXT_SIZE; relying on --fit")
                 fit_fallback = True
         if not fit_fallback:
-            remaining = usable - one_slot
+            remaining = planning_usable - one_slot
             if model_file_bytes <= remaining and one_slot:
                 parallel = min(
                     int(CFG["MAX_PARALLEL_SLOTS"]),
@@ -366,13 +471,15 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
                         break
             elif model_file_bytes > remaining:
                 log(f"{filename}: model weights do not fit next to the {kv_base} KV cache; part will remain on CPU")
-            log(f"Estimated plan for {filename}: ctx-size={context}, KV cache={cache_type}, slots={parallel}")
+            if not (gpu_count == 1 and should_offload and CFG["SPLIT_MODE"] == "layer"):
+                log(f"Estimated plan for {filename}: ctx-size={context}, KV cache={cache_type}, slots={parallel}")
 
     ctx_per_slot = context
     tensor_split = ""
     gpu_layers = ""
     cpu_layers = 0
     offload_kind = ""
+    explicit_gpu_placement = False
     if fit_fallback:
         parallel = 1
         cache_type = kv_base
@@ -391,12 +498,13 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
                 layer_mode = "split-ffn"
             layer_data = layer_bytes(model_file, layer_mode)
             if layer_data:
-                if layer_mode == "split-ffn":
-                    rows = [line.split() for line in layer_data.splitlines()[1:] if line.strip()]
-                    ffn_bytes = sum(int(row[1]) for row in rows if len(row) > 1)
-                    if ffn_bytes and available_ram_bytes() >= ffn_bytes + int(CFG["MOE_RAM_RESERVE_MIB"]) * MIB:
-                        offload, offload_kind = True, "ffn"
                 free_mib = per_gpu_free_mib()
+                if auxiliary_model_bytes and free_mib:
+                    fastest_gpu = max(range(len(speeds)), key=lambda index: speeds[index])
+                    if fastest_gpu < len(free_mib):
+                        free_mib[fastest_gpu] = max(
+                            0, free_mib[fastest_gpu] - (auxiliary_model_bytes + MIB - 1) // MIB
+                        )
                 def try_split(kind: str, slots: int, ctx: int = ctx_per_slot):
                     # Tensor-split estimates use total KV tokens across the configured slots.
                     tokens = ctx * slots
@@ -462,6 +570,41 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
                 log(f"Could not determine per-layer tensor sizes for {filename}; falling back to --fit")
         else:
             log("Could not benchmark per-GPU speed; tensor-split will fall back to --fit")
+    elif gpu_count == 1 and should_offload and params is not None:
+        layer_data = layer_bytes(model_file, "split")
+        plan = single_gpu_moe_plan(
+            layer_data,
+            planning_usable,
+            params,
+            kv_base,
+            ctx_per_slot,
+            int(CFG["MAX_PARALLEL_SLOTS"]),
+            ram_available,
+            ram_reserve,
+            upgrades,
+        )
+        if plan is None:
+            log(f"Could not fit MoE weights and KV cache within GPU/RAM budgets for {filename}; relying on --fit")
+        else:
+            cpu_layers, cpu_weight_bytes, parallel, cache_type = plan
+            offload_kind = "moe" if cpu_layers else ""
+            explicit_gpu_placement = True
+            if cpu_layers:
+                log(
+                    f"{filename}: keeping MoE expert weights of first {cpu_layers} layers "
+                    f"({cpu_weight_bytes // MIB} MiB) on CPU"
+                )
+            log(f"Estimated single-GPU plan for {filename}: ctx-size={context}, KV cache={cache_type}, slots={parallel}")
+    elif (
+        gpu_count == 1
+        and params is not None
+        and CFG["SPLIT_MODE"] == "layer"
+        and model_file_bytes + auxiliary_model_bytes
+        + kv_vram_bytes(params, cache_type, ctx_per_slot, parallel) <= usable
+    ):
+        gpu_layers = "all"
+        explicit_gpu_placement = True
+        log(f"Keeping all model weights on the GPU for decode speed: {filename}")
     else:
         log(f"TENSOR_SPLIT_MODE={CFG['TENSOR_SPLIT_MODE']} or single GPU; relying on llama-server's --fit")
 
@@ -481,11 +624,23 @@ def configure_locked(alias: str, filename: str, model_file: Path) -> None:
     ]
     if tensor_split:
         lines.extend(["fit = off", f"n-gpu-layers = {gpu_layers}", f"tensor-split = {tensor_split}"])
+    elif explicit_gpu_placement:
+        lines.extend(["fit = off", "n-gpu-layers = all"])
     else:
         lines.append(f"n-gpu-layers = {CFG['N_GPU_LAYERS']}")
     if cpu_layers:
         option = "n-cpu-ffn" if offload_kind == "ffn" else "n-cpu-moe"
         lines.append(f"{option} = {cpu_layers}")
+    lines.extend(f"{option} = {value}" for option, value in auxiliary_options.items())
+    if CFG["SPECULATIVE_DECODING"] == "on":
+        if "model-draft" in auxiliary_options:
+            lines.append("spec-type = draft-simple")
+            lines.extend(["spec-draft-type-k = q4_0", "spec-draft-type-v = q4_0"])
+            log(f"Enabling speculative decoding with external draft model for {filename}")
+        elif internal_mtp:
+            lines.append("spec-type = draft-mtp")
+            lines.extend(["spec-draft-type-k = q4_0", "spec-draft-type-v = q4_0"])
+            log(f"Enabling built-in MTP speculative decoding for {filename}")
     lines.extend([f"cache-type-k = {cache_type}", f"cache-type-v = {cache_type}", ""])
     temporary = SECTION_DIR / f".{alias}.ini.tmp-{os.getpid()}"
     SECTION_DIR.mkdir(parents=True, exist_ok=True)
