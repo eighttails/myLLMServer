@@ -369,6 +369,21 @@ models:
   本プロキシは `/api/chat` と `/v1/chat/completions` の両方で連続する assistant メッセージを 1 つに
   結合してから転送します (ログに `merged N consecutive assistant message(s)` と出力)。
 
+### 長時間のthinking後に `Sorry, no response was returned.` で終わる
+
+- 思考型モデルがreasoningだけを生成し、本文もtool callも返さずに終了すると、クライアント側で
+  このエラーになる可能性があります。長時間待ったという事実だけでは、タイムアウトとは断定できません。
+- `/api/chat` は本文もtool callもない応答を正常終了にせず、
+  `llama-server returned no assistant content or tool calls (finish_reason=...)` を返します。
+  ストリーミング開始後はOllama形式の `{"error":"..."}` 行、非ストリーミングはHTTP 502です。
+  非表示のreasoningを本文へ転用したり、自動再試行したりはしません。
+- ログの `chat result: model=... content_chars=... tool_calls=... finish_reason=...` で
+  可視本文とtool callの有無を確認できます。`finish_reason=length` ならクライアントの
+  `options.num_predict` (出力上限) を確認してください。出力上限を増やすと待ち時間も増えます。
+- thinkingを抑える選択肢は `THINKING_MODE=off ./launch-container.sh` です。ただし全モデルの
+  回答の仕方・品質が変わるため、thinkingが必要かを判断したうえで明示的に設定してください。
+  修正の反映にはイメージの再ビルド・コンテナ再作成が必要です。
+
 ### コンテナの状態確認
 
 ```bash

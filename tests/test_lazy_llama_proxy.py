@@ -3,6 +3,7 @@ import io
 import json
 import pathlib
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).parents[1] / "docker" / "lazy-llama-proxy.py"
@@ -220,6 +221,104 @@ class BackendStreamingForwardTests(unittest.TestCase):
 
         self.assertEqual(first_chunk + second_chunk, writes.getvalue())
         self.assertTrue(handler.close_connection)
+
+
+class EmptyOllamaResponseTests(unittest.TestCase):
+    def _handler(self, chunks=None, response=None):
+        handler = object.__new__(PROXY.LazyProxyHandler)
+        handler.command = "POST"
+        handler.path = "/api/chat"
+        handler.headers = {"Content-Type": "application/json"}
+        handler.wfile = io.BytesIO()
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.log_message = mock.Mock()
+        handler.server = mock.Mock()
+        handler.server.model_aliases = {}
+        handler._prepare_model_if_needed = mock.Mock()
+        handler._extract_thinking_mode = lambda: "auto"
+        handler._read_body = lambda: json.dumps({
+            "model": "test",
+            "messages": [{"role": "user", "content": "test"}],
+            "stream": chunks is not None,
+        }).encode()
+        if chunks is not None:
+            def backend_stream(*_args, **_kwargs):
+                for chunk in chunks:
+                    if chunk is None:
+                        yield None
+                    else:
+                        yield f"data: {json.dumps(chunk)}\n".encode()
+                yield b"data: [DONE]\n"
+            handler._iter_backend_stream = backend_stream
+        else:
+            backend_response = io.BytesIO(json.dumps(response).encode())
+            handler._request_backend = lambda *_args, **_kwargs: backend_response
+        return handler
+
+    def test_reasoning_only_stream_returns_error_not_empty_success(self):
+        handler = self._handler(chunks=[
+            None,
+            {"choices": [{"delta": {"reasoning_content": "private reasoning"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ])
+
+        handler._handle()
+
+        responses = [json.loads(line) for line in handler.wfile.getvalue().splitlines()]
+        self.assertIn("no assistant content or tool calls", responses[-1]["error"])
+        self.assertIn("length", responses[-1]["error"])
+        self.assertFalse(any(response.get("done") for response in responses))
+        self.assertNotIn("private reasoning", handler.wfile.getvalue().decode())
+
+    def test_empty_nonstream_response_returns_502(self):
+        handler = self._handler(response={
+            "choices": [{
+                "message": {"content": "", "reasoning_content": "private reasoning"},
+                "finish_reason": "stop",
+            }],
+        })
+
+        handler._handle()
+
+        handler.send_response.assert_called_once_with(502)
+        response = json.loads(handler.wfile.getvalue())
+        self.assertIn("no assistant content or tool calls", response["error"])
+
+    def test_visible_stream_still_finishes_normally(self):
+        handler = self._handler(chunks=[
+            {"choices": [{"delta": {"reasoning_content": "private reasoning"}}]},
+            {"choices": [{"delta": {"content": "answer"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ])
+
+        handler._handle()
+
+        responses = [json.loads(line) for line in handler.wfile.getvalue().splitlines()]
+        self.assertTrue(responses[-1]["done"])
+        self.assertEqual("answer", "".join(r["message"]["content"] for r in responses))
+
+    def test_tool_only_stream_still_finishes_normally(self):
+        handler = self._handler(chunks=[
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"name": "read_file", "arguments": '{"path":'},
+            }]}}]},
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": '"a.txt"}'},
+            }]}, "finish_reason": "tool_calls"}]},
+        ])
+
+        handler._handle()
+
+        responses = [json.loads(line) for line in handler.wfile.getvalue().splitlines()]
+        self.assertTrue(responses[-1]["done"])
+        self.assertEqual(
+            {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
+            responses[-1]["message"]["tool_calls"][0],
+        )
 
 
 if __name__ == "__main__":

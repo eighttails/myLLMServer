@@ -919,6 +919,19 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         """THINKING_MODE 環境変数を取得する (デフォルト: auto)."""
         return os.environ.get("THINKING_MODE", "auto")
 
+    def _validate_ollama_chat_result(self, model, content_chars, tool_calls, finish_reason):
+        self.log_message(
+            "chat result: model=%s content_chars=%d tool_calls=%d finish_reason=%s",
+            model, content_chars, len(tool_calls), finish_reason,
+        )
+        if not content_chars and not tool_calls:
+            raise RuntimeError(
+                "llama-server returned no assistant content or tool calls "
+                f"(finish_reason={finish_reason}). "
+                "The model may have generated only reasoning; check the output token "
+                "limit or explicitly disable thinking if appropriate."
+            )
+
     def _send_tool_loop_stop(self, model, stream, detection):
         message = (
             "同じtool callと結果の反復を検出したため、無限ループを防ぐために実行を停止しました。"
@@ -1011,7 +1024,14 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(resp.read().decode("utf-8"))
             if thinking_mode == "off":
                 data = self._strip_thinking_from_openai_response(data)
-            self._send_json(200, self._openai_to_ollama_chat_response(model, data))
+            response = self._openai_to_ollama_chat_response(model, data)
+            self._validate_ollama_chat_result(
+                model,
+                len(response["message"]["content"]),
+                response["message"].get("tool_calls", []),
+                response["done_reason"],
+            )
+            self._send_json(200, response)
             return
 
         # ストリーミング応答: OpenAI の text/event-stream (SSE) を Ollama の NDJSON に変換する。
@@ -1023,6 +1043,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self._ndjson_stream_started = True
         tool_call_accumulator = {}
+        content_chars = 0
         finish_reason = "stop"
         repetition_detector = (
             TextRepetitionDetector.from_environment()
@@ -1080,8 +1101,12 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 ollama_chunk = self._openai_chunk_to_ollama_chunk(model, chunk)
                 self.wfile.write((json.dumps(ollama_chunk) + "\n").encode("utf-8"))
                 self.wfile.flush()
+                content_chars += len(ollama_chunk["message"]["content"])
             final_message = {"role": "assistant", "content": ""}
             final_tool_calls = self._finalize_tool_calls(tool_call_accumulator)
+            self._validate_ollama_chat_result(
+                model, content_chars, final_tool_calls, finish_reason
+            )
             if final_tool_calls:
                 final_message["tool_calls"] = final_tool_calls
             final = {
