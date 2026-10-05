@@ -4,7 +4,7 @@ import os
 import pathlib
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 DOCKER_DIR = pathlib.Path(__file__).parents[1] / "docker"
@@ -50,6 +50,110 @@ class ContainerScriptTests(unittest.TestCase):
             ),
             self.sync.resolve_model_spec("owner/repo/model.gguf"),
         )
+
+    def test_reads_model_shard_list_from_yaml(self):
+        model_list = load_script("model-list-utils")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "model_list.yml"
+            path.write_text(
+                "models:\n"
+                "  - url: https://huggingface.co/owner/repo/resolve/main/model-00001-of-00002.gguf\n"
+                "    shards:\n"
+                "      - https://huggingface.co/owner/repo/resolve/main/model-00002-of-00002.gguf\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [{
+                    "url": "https://huggingface.co/owner/repo/resolve/main/model-00001-of-00002.gguf",
+                    "shards": [
+                        "https://huggingface.co/owner/repo/resolve/main/model-00002-of-00002.gguf"
+                    ],
+                }],
+                model_list.read_models(str(path)),
+            )
+
+    def test_sync_parser_reads_serialized_shard_list(self):
+        shard = "https://huggingface.co/owner/repo/resolve/main/model-00002-of-00002.gguf"
+        with tempfile.TemporaryDirectory() as temporary:
+            model_list = pathlib.Path(temporary) / "model_list.yml"
+            model_list.write_text("models:\n", encoding="utf-8")
+            output = (
+                "https://huggingface.co/owner/repo/resolve/main/model-00001-of-00002.gguf"
+                "\t\t\t\t"
+                + json.dumps([shard])
+                + "\n"
+            )
+            with (
+                patch.object(self.sync, "MODEL_LIST_FILE", model_list),
+                patch.object(
+                    self.sync.subprocess,
+                    "run",
+                    return_value=Mock(returncode=0, stderr="", stdout=output),
+                ),
+            ):
+                entries = self.sync.parse_models()
+
+        self.assertEqual([shard], entries[0]["shards"])
+
+    def test_resolves_and_validates_all_model_shards(self):
+        first = "https://huggingface.co/owner/repo/resolve/main/model-00001-of-00003.gguf"
+        second = "https://huggingface.co/owner/repo/resolve/main/model-00002-of-00003.gguf"
+        third = "https://huggingface.co/owner/repo/resolve/main/model-00003-of-00003.gguf"
+
+        self.assertEqual(
+            [
+                ("model-00002-of-00003.gguf", second + "?download=true"),
+                ("model-00003-of-00003.gguf", third + "?download=true"),
+            ],
+            self.sync.resolve_model_shards(first, [second, third]),
+        )
+        with self.assertRaisesRegex(self.sync.ModelError, "expected 2 additional shard"):
+            self.sync.resolve_model_shards(first, [second])
+        with self.assertRaisesRegex(self.sync.ModelError, "expected shard 00002"):
+            self.sync.resolve_model_shards(first, [third, second])
+
+    def test_model_sync_downloads_and_preserves_every_configured_shard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_dir = pathlib.Path(temporary)
+            first = "model-00001-of-00002.gguf"
+            second = "model-00002-of-00002.gguf"
+            stale = model_dir / "stale.gguf"
+            stale.write_bytes(b"unused")
+            self.sync.MODEL_DIR = model_dir
+            allowed_files = set()
+            downloads = []
+
+            def download(_url, temporary_path, label):
+                downloads.append(label)
+                temporary_path.write_bytes(label.encode())
+
+            with (
+                patch.object(self.sync, "model_metadata", return_value=("llama", 8192)),
+                patch.object(self.sync, "download_with_resume", side_effect=download),
+                patch.dict(os.environ, {
+                    "CONTEXT_SIZE": "",
+                    "MAX_CONTEXT_SIZE": "",
+                    "KV_CACHE_TYPE": "",
+                }),
+            ):
+                self.sync.process_model(
+                    {
+                        "url": f"https://huggingface.co/owner/repo/resolve/main/{first}",
+                        "shards": [
+                            f"https://huggingface.co/owner/repo/resolve/main/{second}"
+                        ],
+                    },
+                    {},
+                    allowed_files,
+                )
+
+            self.sync.cleanup_unused_models(allowed_files)
+            self.assertEqual(["owner/repo", second], downloads)
+            self.assertTrue((model_dir / first).is_file())
+            self.assertTrue((model_dir / second).is_file())
+            self.assertFalse(stale.exists())
+            self.assertEqual({first, second}, allowed_files)
 
     def test_model_sync_removes_unlisted_files_and_writes_preset(self):
         with tempfile.TemporaryDirectory() as temporary:

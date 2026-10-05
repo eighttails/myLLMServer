@@ -6,6 +6,10 @@
 #   url      (必須) メインの .gguf ファイルの Hugging Face ダウンロードリンク。
 #            「Copy download link」で取得した
 #            https://huggingface.co/{owner}/{repo}/resolve/main/{filename} 形式のURLを指定する。
+#   shards   (任意) 分割GGUFの2個目以降のシャードURL一覧。
+#            url には必ず -00001-of-NNNNN.gguf を指定し、shards には
+#            -00002-of-NNNNN.gguf から最後まで順番にすべて記述する。
+#            全シャードは同じリポジトリに置き、ファイル名の連番を揃えること。
 #   mtp      (任意) MTP (Multi-Token Prediction) / 投機的デコーディング用のドラフトモデルのURL。
 #            自動ダウンロードされ、モデル切替時に llama-server の preset へ
 #            `model-draft = <ダウンロード先パス>` として自動適用される。
@@ -24,6 +28,11 @@
 models:
   # 通常モデル (mtp/mmproj/imatrix なし)
   - url: https://huggingface.co/unsloth/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+  # 分割GGUFモデル (url が1個目、shards に残りを順番に列挙)
+  # - url: https://huggingface.co/<owner>/<repo>/resolve/main/<model>-00001-of-00002.gguf
+  #   shards:
+  #     - https://huggingface.co/<owner>/<repo>/resolve/main/<model>-00002-of-00002.gguf
 
   # MTP内蔵モデル + 別ファイルの mmproj + imatrix を持つ例
   # (このリポジトリの "-mtp.gguf" はメインモデル自体にMTPヘッドが内蔵されているため、
@@ -45,3 +54,4 @@ models:
   - url: https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_0.gguf
     mtp: https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/main/mtp-gemma-4-12B-it-Q4_0.gguf
     mmproj: https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF/resolve/main/mmproj-gemma-4-12B-it-Q8_0.gguf
+

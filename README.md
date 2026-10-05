@@ -100,7 +100,7 @@ VS Code 上から利用できます。チャットはストリーミング/非�
 ### 2. モデルリストを変更する
 
 自分が使いたいモデルを指定・変更する場合は、`model_list.yml` を編集します。
-`models` 配列の各要素に `url` を指定し、必要なら `mtp` (投機的デコーディング用ドラフトモデル、llama-server の `model-draft` として自動適用)、`mmproj` (マルチモーダル投影、`mmproj` として自動適用) のURLを追加します。投機的デコードは既定で無効です。`SPECULATIVE_DECODING=on` を設定すると、`mtp` 指定時は `draft-simple`、GGUF内に対応する内蔵MTPヘッドがある場合は `draft-mtp` を使用します。有効化時のドラフトKVキャッシュはQ4です。`imatrix` (量子化用データ、再量子化などに使う場合のみ) はダウンロードだけ行い、llama-server の推論設定には反映されません(llama-serverに imatrix を読み込む実行時オプションが無いため)。
+`models` 配列の各要素に `url` を指定し、必要なら `shards` (分割GGUFの2個目以降)、`mtp` (投機的デコーディング用ドラフトモデル、llama-server の `model-draft` として自動適用)、`mmproj` (マルチモーダル投影、`mmproj` として自動適用) のURLを追加します。投機的デコードは既定で無効です。`SPECULATIVE_DECODING=on` を設定すると、`mtp` 指定時は `draft-simple`、GGUF内に対応する内蔵MTPヘッドがある場合は `draft-mtp` を使用します。有効化時のドラフトKVキャッシュはQ4です。`imatrix` (量子化用データ、再量子化などに使う場合のみ) はダウンロードだけ行い、llama-server の推論設定には反映されません(llama-serverに imatrix を読み込む実行時オプションが無いため)。
 
 ```text
 # model_list.yml の例
@@ -109,7 +109,17 @@ models:
     mtp: https://huggingface.co/<owner>/<repo>/resolve/main/<draft>.gguf
     mmproj: https://huggingface.co/<owner>/<repo>/resolve/main/mmproj-model-f16.gguf
     imatrix: https://huggingface.co/<owner>/<repo>/resolve/main/imatrix.dat
+
+  # 分割GGUF: url は1個目、shards は2個目以降を順番にすべて指定
+  - url: https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+    shards:
+      - https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
 ```
+
+`url`のファイル名は`<名前>-00001-of-<合計数>.gguf`形式で、必ず1個目を指定します。
+`shards`には`00002`から合計数までを順番に指定してください。全シャードは同一リポジトリに置きます。
+同期時に連番・総数・配置を検証して全シャードをダウンロードし、モデルの一部として保持します。分割でないGGUFへの`shards`指定、
+シャードの不足・順番違い・別リポジトリ指定は、そのモデル設定のエラーになります。従来の単体GGUF設定はそのまま使えます。
 
 編集後、コンテナを再起動せずに `model_list.yml` を再ロードして変更を即座に反映したい場合は、`./reload-model.sh` を実行します。
 このコマンドは起動中のコンテナを前提とし、モデルリストを共有ディレクトリへ反映した後、コンテナ内のPython同期処理を実行します。
@@ -119,7 +129,7 @@ models:
 ```
 
 このコマンド（または `./launch-container.sh`）を実行すると、以下の処理が自動で行われます:
-- `model_list.yml` に新たに追加されたモデル・補助ファイルを Hugging Face から自動ダウンロード
+- `model_list.yml` に新たに追加されたモデル・全シャード・補助ファイルを Hugging Face から自動ダウンロード
 - インストール済みだが `model_list.yml` に記載のない（今後使わない）モデル・補助ファイルをディスク（`models/`）から自動削除
 - サーバー（llama-server および プロキシ）のモデルリストを即座に更新
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,9 @@ class ModelError(Exception):
     """モデル1件の処理をスキップできるエラー。"""
 
 
+SHARD_FILENAME = re.compile(r"^(.*)-(\d+)-of-(\d+)\.gguf$")
+
+
 def log(message: str) -> None:
     print(f"[llama-wrapper] {message}", file=sys.stderr, flush=True)
 
@@ -50,7 +54,7 @@ def hf_download_url(url: str) -> str:
     return url
 
 
-def parse_models() -> list[dict[str, str]]:
+def parse_models() -> list[dict[str, str | list[str]]]:
     if MODEL_LIST_FILE.is_file():
         result = subprocess.run(
             ["/usr/local/bin/model-list-utils.py", str(MODEL_LIST_FILE)],
@@ -60,11 +64,14 @@ def parse_models() -> list[dict[str, str]]:
         )
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "failed to read model list")
-        keys = ("url", "mtp", "mmproj", "imatrix")
+        keys = ("url", "mtp", "mmproj", "imatrix", "shards")
         return [
-            dict(zip(keys, line.split("\t") + [""] * 4))
+            {
+                **dict(zip(keys[:4], fields[:4])),
+                "shards": json.loads(fields[4]) if len(fields) > 4 else [],
+            }
             for line in result.stdout.splitlines()
-            if line.strip()
+            if (fields := line.split("\t")) and fields[0].strip()
         ]
     legacy = os.environ.get("MODEL_NAMES_CSV", "")
     if not legacy:
@@ -200,6 +207,44 @@ def resolve_model_spec(spec: str) -> tuple[str, str, str]:
     return repo, filename, f"{HF_ENDPOINT}/{repo}/resolve/main/{filename}?download=true"
 
 
+def resolve_model_shards(url: str, shard_urls: list[str]) -> list[tuple[str, str]]:
+    repo, filename, _ = resolve_model_spec(url)
+    match = SHARD_FILENAME.fullmatch(filename)
+    if not match:
+        if shard_urls:
+            raise ModelError(f"shards can only be used with a numbered GGUF shard: {filename}")
+        return []
+
+    prefix, first_index, total_count = match.groups()
+    first_index = int(first_index)
+    total_count = int(total_count)
+    if total_count < 2 or first_index != 1:
+        raise ModelError(f"the model url must point to the first shard (part 1 of at least 2): {filename}")
+    if len(shard_urls) != total_count - 1:
+        raise ModelError(
+            f"expected {total_count - 1} additional shard URL(s) for {filename}, got {len(shard_urls)}"
+        )
+
+    resolved = []
+    for expected_index, shard_url in enumerate(shard_urls, start=2):
+        shard_repo, shard_filename, download_url = resolve_model_spec(shard_url)
+        shard_match = SHARD_FILENAME.fullmatch(shard_filename)
+        if shard_repo != repo or not shard_match:
+            raise ModelError(f"shard must be in the same repository and use the same numbered pattern: {shard_url}")
+        shard_prefix, shard_index, shard_total = shard_match.groups()
+        if (
+            shard_prefix != prefix
+            or int(shard_index) != expected_index
+            or int(shard_total) != total_count
+        ):
+            raise ModelError(
+                f"expected shard {expected_index:0{len(match.group(2))}d}-of-{total_count:0{len(match.group(3))}d} "
+                f"for {filename}, got {shard_filename}"
+            )
+        resolved.append((shard_filename, download_url))
+    return resolved
+
+
 def write_atomic(path: Path, content: str) -> None:
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     temporary.write_text(content, encoding="utf-8")
@@ -207,7 +252,7 @@ def write_atomic(path: Path, content: str) -> None:
 
 
 def process_model(
-    entry: dict[str, str],
+    entry: dict[str, str | list[str]],
     metadata_cache: dict[tuple[str, str], tuple[str, int]],
     allowed_files: set[str],
 ) -> tuple[str, str]:
@@ -219,6 +264,12 @@ def process_model(
         )
     if not filename.endswith(".gguf"):
         raise ModelError(f"model must be a .gguf file: {filename}")
+
+    shard_urls = entry.get("shards", [])
+    if not isinstance(shard_urls, list) or any(not isinstance(item, str) or not item.strip() for item in shard_urls):
+        raise ModelError(f"shards must be a list of non-empty URLs for {filename}")
+    shard_files = resolve_model_shards(spec, shard_urls)
+    model_files = [filename, *(shard_filename for shard_filename, _ in shard_files)]
 
     auxiliary_names: dict[str, str] = {}
     for key in ("mtp", "mmproj", "imatrix"):
@@ -252,6 +303,19 @@ def process_model(
             log(f"error: skipping model due to download failure: {repo}: {error}")
             raise
 
+    for shard_filename, shard_download_url in shard_files:
+        shard_destination = MODEL_DIR / shard_filename
+        if shard_destination.is_file() and shard_destination.stat().st_size > 0:
+            continue
+        log(f"Downloading shard {shard_filename}")
+        temporary = Path(f"{shard_destination}.part")
+        try:
+            download_with_resume(shard_download_url, temporary, shard_filename)
+            temporary.replace(shard_destination)
+        except ModelError as error:
+            log(f"error: skipping model due to shard download failure: {shard_filename}: {error}")
+            raise
+
     try:
         architecture, detected_context = cached_metadata or model_metadata(destination)
     except ModelError as error:
@@ -283,7 +347,7 @@ def process_model(
         if auxiliary_names[key]:
             lines.append(f"{option} = {MODEL_DIR / auxiliary_names[key]}")
     lines.extend([f"cache-type-k = {cache_type}", f"cache-type-v = {cache_type}", ""])
-    allowed_files.add(filename)
+    allowed_files.update(model_files)
     return metadata_line, alias_line + "\n" + "\n".join(lines)
 
 
