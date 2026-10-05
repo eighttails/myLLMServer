@@ -299,6 +299,41 @@ class EmptyOllamaResponseTests(unittest.TestCase):
         self.assertTrue(responses[-1]["done"])
         self.assertEqual("answer", "".join(r["message"]["content"] for r in responses))
 
+    def test_stream_includes_backend_usage_in_final_ollama_chunk(self):
+        handler = self._handler(chunks=[
+            {"choices": [{"delta": {"content": "answer"}}]},
+            {
+                "choices": [],
+                "usage": {"prompt_tokens": 123, "completion_tokens": 7},
+            },
+        ])
+        backend_request = {}
+        backend_stream = handler._iter_backend_stream
+
+        def capture_backend_request(method, path, body=b"", headers=None):
+            backend_request.update(json.loads(body.decode("utf-8")))
+            return backend_stream(method, path, body=body, headers=headers)
+
+        handler._iter_backend_stream = capture_backend_request
+
+        handler._handle()
+
+        responses = [json.loads(line) for line in handler.wfile.getvalue().splitlines()]
+        self.assertEqual({"include_usage": True}, backend_request["stream_options"])
+        self.assertEqual(123, responses[-1]["prompt_eval_count"])
+        self.assertEqual(7, responses[-1]["eval_count"])
+
+    def test_stream_without_backend_usage_does_not_report_fake_zero_counts(self):
+        handler = self._handler(chunks=[
+            {"choices": [{"delta": {"content": "answer"}}]},
+        ])
+
+        handler._handle()
+
+        response = json.loads(handler.wfile.getvalue().splitlines()[-1])
+        self.assertNotIn("prompt_eval_count", response)
+        self.assertNotIn("eval_count", response)
+
     def test_tool_only_stream_still_finishes_normally(self):
         handler = self._handler(chunks=[
             {"choices": [{"delta": {"tool_calls": [{
@@ -319,6 +354,26 @@ class EmptyOllamaResponseTests(unittest.TestCase):
             {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
             responses[-1]["message"]["tool_calls"][0],
         )
+
+
+class OllamaPsTests(unittest.TestCase):
+    def test_includes_configured_per_slot_context_length(self):
+        handler = object.__new__(PROXY.LazyProxyHandler)
+        entry = {"alias": "test", "filename": "test.gguf"}
+        handler.server = mock.Mock()
+        handler.server.active_model = "test"
+        handler.server.model_entries = [entry]
+        handler.server.model_context_length.return_value = 8192
+        handler._ollama_model_size = lambda _filename: 1234
+        response = {}
+        handler._send_json = lambda status, payload: response.update(
+            status=status, payload=payload
+        )
+
+        handler._send_ollama_ps()
+
+        self.assertEqual(200, response["status"])
+        self.assertEqual(8192, response["payload"]["models"][0]["context_length"])
 
 
 if __name__ == "__main__":

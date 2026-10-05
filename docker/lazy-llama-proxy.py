@@ -728,6 +728,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                         },
                         "expires_at": "0001-01-01T00:00:00Z",
                         "size_vram": 0,
+                        "context_length": self.server.model_context_length(entry),
                     }
                 )
         self._send_json(200, {"models": models})
@@ -1006,6 +1007,8 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             # (llama-server自体は正常に生成を継続しているにもかかわらず)。
             "stream": stream,
         }
+        if stream:
+            openai_payload["stream_options"] = {"include_usage": True}
         if tools:
             openai_payload["tools"] = tools
         if "tool_choice" in request_payload:
@@ -1045,6 +1048,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
         tool_call_accumulator = {}
         content_chars = 0
         finish_reason = "stop"
+        backend_usage = {}
         repetition_detector = (
             TextRepetitionDetector.from_environment()
             if _env_enabled("GENERATION_LOOP_DETECTION")
@@ -1070,6 +1074,8 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(chunk.get("usage"), dict):
+                    backend_usage = chunk["usage"]
                 if thinking_mode == "off":
                     chunk = self._strip_thinking_from_openai_chunk(chunk)
                 choice = (chunk.get("choices") or [{}])[0]
@@ -1116,6 +1122,13 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 "done": True,
                 "done_reason": finish_reason,
             }
+            for source, target in (
+                ("prompt_tokens", "prompt_eval_count"),
+                ("completion_tokens", "eval_count"),
+            ):
+                count = backend_usage.get(source)
+                if isinstance(count, int) and not isinstance(count, bool):
+                    final[target] = count
             self.wfile.write((json.dumps(final) + "\n").encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

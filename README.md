@@ -67,6 +67,8 @@ KV キャッシュ量子化や `tensor-split` などの重い計算は起動時�
 も実装しており、tool calling の `tools` / `tool_calls` を含めて内部で OpenAI 互換 API に変換し、
 `llama-server` へ転送します。`tools` を指定したリクエストでも常にバックエンドとはストリーミングで
 通信し、生成中も応答チャンクを継続して送ることでクライアント側の無通信タイムアウトを防ぎます。
+ストリーミング応答の最終チャンクには、バックエンドが返す`prompt_eval_count`と`eval_count`を含めます。
+`GET /api/ps`は稼働中モデルのスロットあたりの`context_length`も返します。
 `tool_calls` はストリーミング中に断片(index単位で分割された name/arguments)を組み立て、
 生成完了時にまとめてクライアントへ返します。推論内容や未完成の `tool_calls` 断片は公開せず、
 空のcontentチャンクを継続して送ります。バックエンドからSSEが届かない推論区間も15秒間隔で
