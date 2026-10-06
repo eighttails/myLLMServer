@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -270,6 +271,7 @@ def process_model(
         raise ModelError(f"shards must be a list of non-empty URLs for {filename}")
     shard_files = resolve_model_shards(spec, shard_urls)
     model_files = [filename, *(shard_filename for shard_filename, _ in shard_files)]
+    allowed_files.update(model_files)
 
     auxiliary_names: dict[str, str] = {}
     for key in ("mtp", "mmproj", "imatrix"):
@@ -330,7 +332,9 @@ def process_model(
     max_context = os.environ.get("MAX_CONTEXT_SIZE")
     if max_context and configured_context > int(max_context):
         configured_context = int(max_context)
-    alias = filename.removesuffix(".gguf")
+    # 分割GGUFは "-00001-of-0000N" を除いた名前をモデル名として公開する
+    shard_match = SHARD_FILENAME.fullmatch(filename) if shard_files else None
+    alias = shard_match.group(1) if shard_match else filename.removesuffix(".gguf")
     metadata_line = f"{filename}\t{signature(destination)}\t{architecture}\t{detected_context}"
     alias_line = f"{alias}\t{filename}\t{architecture}\t{configured_context}"
     cache_type = os.environ.get("KV_CACHE_TYPE") or "q4_0"
@@ -347,7 +351,6 @@ def process_model(
         if auxiliary_names[key]:
             lines.append(f"{option} = {MODEL_DIR / auxiliary_names[key]}")
     lines.extend([f"cache-type-k = {cache_type}", f"cache-type-v = {cache_type}", ""])
-    allowed_files.update(model_files)
     return metadata_line, alias_line + "\n" + "\n".join(lines)
 
 
@@ -362,13 +365,26 @@ def cleanup_unused_models(allowed_files: set[str]) -> None:
 
 def main() -> int:
     try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        with (MODEL_DIR / ".sync-model.lock").open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            return sync_models()
+    except (OSError, RuntimeError, ValueError) as error:
+        log(f"error: {error}")
+        return 1
+
+
+def sync_models() -> int:
+    preset_tmp = Path(f"{PRESET_SECTION_DIR}.tmp-{os.getpid()}")
+    backup = Path(f"{PRESET_SECTION_DIR}.backup-{os.getpid()}")
+    try:
         entries = parse_models()
         if not entries:
             raise RuntimeError("no valid model entries found in model_list.yml")
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        preset_tmp = Path(f"{PRESET_SECTION_DIR}.tmp")
         if preset_tmp.exists():
             shutil.rmtree(preset_tmp)
+        if backup.exists():
+            shutil.rmtree(backup)
         preset_tmp.mkdir(parents=True)
         metadata_cache = read_metadata_cache()
         allowed_files: set[str] = set()
@@ -394,8 +410,15 @@ def main() -> int:
 
         cleanup_unused_models(allowed_files)
         if PRESET_SECTION_DIR.exists():
-            shutil.rmtree(PRESET_SECTION_DIR)
-        preset_tmp.replace(PRESET_SECTION_DIR)
+            PRESET_SECTION_DIR.replace(backup)
+        try:
+            preset_tmp.replace(PRESET_SECTION_DIR)
+        except OSError:
+            if backup.exists() and not PRESET_SECTION_DIR.exists():
+                backup.replace(PRESET_SECTION_DIR)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
         write_atomic(MODEL_ALIAS_FILE, "\n".join(alias_rows) + "\n")
         write_atomic(METADATA_CACHE_FILE, "\n".join(metadata_rows) + "\n")
         preset = "[*]\nfit = on\nsplit-mode = " + (os.environ.get("SPLIT_MODE") or "layer") + "\n\n"
@@ -416,6 +439,9 @@ def main() -> int:
     except (OSError, RuntimeError, ValueError) as error:
         log(f"error: {error}")
         return 1
+    finally:
+        if preset_tmp.exists():
+            shutil.rmtree(preset_tmp)
 
 
 if __name__ == "__main__":

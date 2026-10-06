@@ -336,6 +336,8 @@ class LazyProxy(http.server.ThreadingHTTPServer):
             filename = entry["filename"]
             aliases[alias] = alias
             aliases[filename] = alias
+            # 分割GGUFの旧モデル名 (先頭シャードのファイル名) を指定するクライアントも受け付ける
+            aliases.setdefault(filename.removesuffix(".gguf"), alias)
         return aliases
 
     def model_context_length(self, entry):
@@ -416,6 +418,23 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
                 if isinstance(payload.get(key), str):
                     return payload[key]
         return None
+
+    def _replace_body_model(self, body, model, canonical_model):
+        """別名 (ファイル名など) で指定されたモデル名を、llama-server が知る正式名へ置き換える。"""
+        if not body or not model or not canonical_model or model == canonical_model:
+            return body
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+        if not isinstance(payload, dict):
+            return body
+        replaced = False
+        for key in ("model", "name"):
+            if payload.get(key) == model:
+                payload[key] = canonical_model
+                replaced = True
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8") if replaced else body
 
     def _request_backend(self, method, path, body=b"", headers=None):
         headers = headers or {}
@@ -1227,7 +1246,7 @@ class LazyProxyHandler(http.server.BaseHTTPRequestHandler):
             if self.command == "POST" and parsed_path == "/api/chat":
                 self._handle_ollama_chat(body, canonical_model or model)
                 return
-            self._forward(body)
+            self._forward(self._replace_body_model(body, model, canonical_model))
         except subprocess.CalledProcessError as err:
             self.log_message("failed to prepare model preset: %s", err)
             self._send_error_json(502, f"failed to prepare model preset for {model}")

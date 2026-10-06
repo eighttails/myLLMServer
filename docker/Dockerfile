@@ -4,6 +4,9 @@ USER root
 
 # llama-bench / llama-server などのバイナリは /app に置かれるが PATH に含まれていないため追加する
 ENV PATH="/app:${PATH}"
+# pip 版 gguf は llama.cpp 本体より古く新しい量子化型 (Q2_0 等) を読めないため、
+# バイナリと同じコミットの /app/gguf-py を gguf-dump で優先して使う
+ENV PYTHONPATH="/app/gguf-py"
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates curl \

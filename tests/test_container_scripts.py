@@ -190,6 +190,42 @@ class ContainerScriptTests(unittest.TestCase):
             self.assertIn("ctx-size = 262144", preset)
             self.assertIn("cache-type-k = q4_0", preset)
 
+    def test_failed_sharded_model_keeps_configured_shards_during_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model_dir = pathlib.Path(temporary)
+            first = "model-00001-of-00002.gguf"
+            second = "model-00002-of-00002.gguf"
+            self.sync.MODEL_DIR = model_dir
+            allowed_files = set()
+
+            def download(_url, temporary_path, label):
+                temporary_path.write_bytes(label.encode())
+
+            with (
+                patch.object(self.sync, "download_with_resume", side_effect=download),
+                patch.object(
+                    self.sync,
+                    "model_metadata",
+                    side_effect=self.sync.ModelError("metadata unavailable"),
+                ),
+            ):
+                with self.assertRaises(self.sync.ModelError):
+                    self.sync.process_model(
+                        {
+                            "url": f"https://huggingface.co/owner/repo/resolve/main/{first}",
+                            "shards": [
+                                f"https://huggingface.co/owner/repo/resolve/main/{second}"
+                            ],
+                        },
+                        {},
+                        allowed_files,
+                    )
+
+            self.sync.cleanup_unused_models(allowed_files)
+            self.assertEqual({first, second}, allowed_files)
+            self.assertFalse((model_dir / first).exists())
+            self.assertTrue((model_dir / second).is_file())
+
     def test_detects_builtin_mtp_tensor_names(self):
         dump = json.dumps({
             "tensors": {
